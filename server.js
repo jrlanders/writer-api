@@ -137,10 +137,11 @@ app.post('/ingest', async (req, res) => {
       const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch })
       for (let j = 0; j < batch.length; j++) {
         const vec = resp.data[j].embedding
+        const vecStr = `[${vec.map(v => v.toFixed(8)).join(',')}]`  // pgvector literal
         await pool.query(
           `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
-           VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
-          [project_id, doc_id, i + j + 1, batch[j], vec, JSON.stringify({ title, doc_type })]
+           VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
+          [project_id, doc_id, i + j + 1, batch[j], vecStr, JSON.stringify({ title, doc_type })]
         )
       }
     }
@@ -187,10 +188,11 @@ app.post('/update', async (req, res) => {
         const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch })
         for (let j = 0; j < batch.length; j++) {
           const vec = resp.data[j].embedding
+          const vecStr = `[${vec.map(v => v.toFixed(8)).join(',')}]`
           await pool.query(
             `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
-             VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
-            [project_id, document_id, i + j + 1, batch[j], vec, JSON.stringify({ title: title ?? '(updated)', doc_type: 'update' })]
+             VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
+            [project_id, document_id, i + j + 1, batch[j], vecStr, JSON.stringify({ title: title ?? '(updated)', doc_type: 'update' })]
           )
         }
       }

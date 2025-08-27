@@ -104,6 +104,46 @@ app.post('/ask', async (req, res) => {
 //     res.end()
 //   }
 // })
+// Streaming endpoint (Server-Sent Events)
+app.post('/ask-stream', async (req, res) => {
+  try {
+    const { question, project_id, project_name='My Project', history=[] } = req.body || {}
+    if (!question || !project_id) {
+      return res.status(400).json({ error: 'question & project_id required' })
+    }
+
+    const ctx = await retrieveTopK(project_id, question, 8)
+    const contextBlock = ctx.map((r,i)=>`[${i+1}] ${r.chunk_text}`).join('\n\n')
+
+    res.writeHead(200, {
+      'Content-Type':'text/event-stream',
+      'Cache-Control':'no-cache',
+      'Connection':'keep-alive',
+      'Access-Control-Allow-Origin':'*'
+    })
+
+    const messages = [
+      { role:'system', content:`You are James's private writing assistant for "${project_name}". Use only the provided context. Maintain continuity and Writing-from-the-Middle.` },
+      ...history,
+      { role:'user', content:`Context:\n${contextBlock}\n\nQuestion: ${question}` }
+    ]
+
+    const stream = await openai.chat.completions.create({
+      model: process.env.MODEL_CHAT || 'gpt-4o',
+      messages, temperature: 0.7, stream: true
+    })
+
+    for await (const chunk of stream) {
+      const delta = chunk?.choices?.[0]?.delta?.content || ''
+      if (delta) res.write(`data:${JSON.stringify({ delta })}\n\n`)
+    }
+    res.write(`data:${JSON.stringify({ done:true, used_context: ctx })}\n\n`)
+    res.end()
+  } catch (e) {
+    res.write(`data:${JSON.stringify({ error:String(e) })}\n\n`)
+    res.end()
+  }
+})
 
 const PORT = process.env.PORT || 8787
 app.listen(PORT, () => console.log(`API running on :${PORT}`))

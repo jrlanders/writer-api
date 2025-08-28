@@ -291,19 +291,25 @@ app.post('/update-by-title', requireAuth, async (req, res) => {
   }
 })
 
-// ---------- LIST: recent docs ----------
 app.get('/list-docs', async (req, res) => {
   try {
-    const { project_id, project_name } = req.query
+    const { project_id, project_name, doc_type, q } = req.query
     const pid = await resolveProjectId(project_id, project_name)
     const limit = Math.min(parseInt(req.query.limit || '25', 10), 100)
+
+    const clauses = ['project_id = $1']
+    const vals = [pid]
+    let idx = 2
+    if (doc_type) { clauses.push(`doc_type = $${idx++}`); vals.push(doc_type) }
+    if (q)        { clauses.push(`(title ILIKE $${idx} OR tags::text ILIKE $${idx})`); vals.push(`%${q}%`); idx++ }
+
     const { rows } = await pool.query(
       `SELECT id, title, doc_type, tags, created_at, updated_at
          FROM documents
-        WHERE project_id = $1
+        WHERE ${clauses.join(' AND ')}
         ORDER BY updated_at DESC
-        LIMIT $2`,
-      [pid, limit]
+        LIMIT $${idx}`,
+      [...vals, limit]
     )
     res.json({ items: rows })
   } catch (e) {
@@ -311,11 +317,50 @@ app.get('/list-docs', async (req, res) => {
   }
 })
 
+// ---------- READ: get one doc by UUID ----------
+app.get('/doc', async (req, res) => {
+  try {
+    const { id } = req.query
+    if (!id) return res.status(400).json({ error: 'id (document UUID) required' })
+    const { rows } = await pool.query(
+      `SELECT id, project_id, title, doc_type, tags, body_md, created_at, updated_at
+         FROM documents
+        WHERE id = $1
+        LIMIT 1`,
+      [id]
+    )
+    if (!rows.length) return res.status(404).json({ error: 'Document not found' })
+    res.json(rows[0])
+  } catch (e) {
+    res.status(500).json({ error: String(e) })
+  }
+})
+
+// ---------- READ: get latest doc by title (by project name or id) ----------
+app.get('/doc-by-title', async (req, res) => {
+  try {
+    const { project_id, project_name, title } = req.query
+    if (!title) return res.status(400).json({ error: 'title required' })
+    const pid = await resolveProjectId(project_id, project_name)
+    const { rows } = await pool.query(
+      `SELECT id, project_id, title, doc_type, tags, body_md, created_at, updated_at
+         FROM documents
+        WHERE project_id = $1 AND title = $2
+        ORDER BY updated_at DESC
+        LIMIT 1`,
+      [pid, title]
+    )
+    if (!rows.length) return res.status(404).json({ error: 'Document not found' })
+    res.json(rows[0])
+  } catch (e) {
+    res.status(500).json({ error: String(e) })
+  }
+})
 // ---------- OpenAPI 3.1.0 for GPT Actions ----------
 app.get('/openapi.json', (_req, res) => {
   res.json({
     openapi: "3.1.0",
-    info: { title: "Writer Brain API", version: "1.1.0" },
+    info: { title: "Writer Brain API", version: "1.2.0" },
     servers: [{ url: "https://writer-api-p0c7.onrender.com" }],
     paths: {
       "/ask": {
@@ -352,6 +397,7 @@ app.get('/openapi.json', (_req, res) => {
           responses: { "200": { description: "Answer JSON" } }
         }
       },
+
       "/ingest": {
         post: {
           operationId: "ingestDoc",
@@ -379,11 +425,22 @@ app.get('/openapi.json', (_req, res) => {
           responses: {
             "200": {
               description: "Ingested",
-              content: { "application/json": { schema: { type: "object", properties: { ok: { type: "boolean" }, document_id: { type: "string", format: "uuid" } } } } }
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      ok: { type: "boolean" },
+                      document_id: { type: "string", format: "uuid" }
+                    }
+                  }
+                }
+              }
             }
           }
         }
       },
+
       "/update": {
         post: {
           operationId: "updateDoc",
@@ -411,6 +468,7 @@ app.get('/openapi.json', (_req, res) => {
           responses: { "200": { description: "Updated" } }
         }
       },
+
       "/update-by-title": {
         post: {
           operationId: "updateDocByTitle",
@@ -437,6 +495,33 @@ app.get('/openapi.json', (_req, res) => {
           responses: { "200": { description: "Updated" } }
         }
       },
+
+      // 🔎 READ: get a single document by UUID (returns full body_md)
+      "/doc": {
+        get: {
+          operationId: "getDoc",
+          summary: "Get a single document by UUID (returns full body_md)",
+          parameters: [
+            { in: "query", name: "id", required: true, schema: { type: "string", format: "uuid" } }
+          ],
+          responses: { "200": { description: "Document" } }
+        }
+      },
+
+      // 🔎 READ: get latest doc by title within a project (by id or name)
+      "/doc-by-title": {
+        get: {
+          operationId: "getDocByTitle",
+          summary: "Get latest doc by title (by project name or id)",
+          parameters: [
+            { in: "query", name: "project_id", required: false, schema: { type: "string" } },
+            { in: "query", name: "project_name", required: false, schema: { type: "string" } },
+            { in: "query", name: "title", required: true, schema: { type: "string" } }
+          ],
+          responses: { "200": { description: "Document" } }
+        }
+      },
+
       "/list-docs": {
         get: {
           operationId: "listDocs",
@@ -444,11 +529,14 @@ app.get('/openapi.json', (_req, res) => {
           parameters: [
             { in: "query", name: "project_id", required: false, schema: { type: "string" } },
             { in: "query", name: "project_name", required: false, schema: { type: "string" } },
+            { in: "query", name: "doc_type", required: false, schema: { type: "string" }, description: "Filter by doc_type (e.g., character, note, chapter)" },
+            { in: "query", name: "q", required: false, schema: { type: "string" }, description: "Search in title or tags (ILIKE)" },
             { in: "query", name: "limit", required: false, schema: { type: "integer", default: 25, minimum: 1, maximum: 100 } }
           ],
           responses: { "200": { description: "Document list" } }
         }
       },
+
       "/projects": {
         get: {
           operationId: "listProjects",
@@ -457,6 +545,7 @@ app.get('/openapi.json', (_req, res) => {
           responses: { "200": { description: "Projects" } }
         }
       },
+
       "/project": {
         post: {
           operationId: "createOrGetProject",
@@ -464,14 +553,27 @@ app.get('/openapi.json', (_req, res) => {
           security: [{ bearerAuth: [] }],
           requestBody: {
             required: true,
-            content: { "application/json": { schema: { type: "object", required: ["name"], properties: { name: { type: "string" }, description: { type: "string" } } } } }
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["name"],
+                  properties: {
+                    name: { type: "string" },
+                    description: { type: "string" }
+                  }
+                }
+              }
+            }
           },
           responses: { "200": { description: "Project id" } }
         }
       }
     },
     components: {
-      securitySchemes: { bearerAuth: { type: "http", scheme: "bearer", bearerFormat: "JWT" } },
+      securitySchemes: {
+        bearerAuth: { type: "http", scheme: "bearer", bearerFormat: "JWT" }
+      },
       schemas: {}
     }
   })

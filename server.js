@@ -348,5 +348,126 @@ app.get('/list-docs', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
+app.get('/openapi.json', (_req, res) => {
+  res.json({
+    openapi: "3.1.0",
+    info: { title: "Writer Brain API", version: "1.0.0" },
+    servers: [{ url: "https://writer-api-p0c7.onrender.com" }],
+    paths: {
+      "/ask": {
+        post: {
+          operationId: "askProject",
+          summary: "Retrieve an answer using RAG",
+          requestBody: {
+            required: true,
+            content: { "application/json": {
+              schema: {
+                type: "object",
+                required: ["question","project_id"],
+                properties: {
+                  question: { type: "string" },
+                  project_id: { type: "string" },
+                  project_name: { type: "string" },
+                  history: {
+                    type: "array",
+                    items: { type:"object", properties:{ role:{type:"string"}, content:{type:"string"} } }
+                  }
+                }
+              }
+            }}
+          },
+          responses: { "200": { description: "Answer JSON" } }
+        }
+      },
+      "/ingest": {
+        post: {
+          operationId: "ingestDoc",
+          summary: "Create a new document and embed it",
+          security: [{ bearerAuth: [] }],
+          requestBody: {
+            required: true,
+            content: { "application/json": {
+              schema: {
+                type: "object",
+                required: ["project_id","doc_type","title","body_md"],
+                properties: {
+                  project_id: { type: "string" },
+                  doc_type: { type: "string" },
+                  title: { type: "string" },
+                  body_md: { type: "string" },
+                  tags: { type: "array", items: { type: "string" } }
+                }
+              }
+            }}
+          },
+          responses: { "200": { description: "Ingested" } }
+        }
+      },
+      "/update": {
+        post: {
+          operationId: "updateDoc",
+          summary: "Update an existing document by UUID and re-embed",
+          security: [{ bearerAuth: [] }],
+          requestBody: {
+            required: true,
+            content: { "application/json": {
+              schema: {
+                type: "object",
+                required: ["document_id","project_id"],
+                properties: {
+                  document_id: { type: "string" },
+                  project_id: { type: "string" },
+                  title: { type: "string" },
+                  body_md: { type: "string" },
+                  tags: { type: "array", items: { type: "string" } }
+                }
+              }
+            }}
+          },
+          responses: { "200": { description: "Updated" } }
+        }
+      },
+      "/update-by-title": {
+        post: {
+          operationId: "updateDocByTitle",
+          summary: "Update a document by title (no UUID) and re-embed",
+          security: [{ bearerAuth: [] }],
+          requestBody: {
+            required: true,
+            content: { "application/json": {
+              schema: {
+                type: "object",
+                required: ["project_id","title"],
+                properties: {
+                  project_id: { type: "string" },
+                  title: { type: "string" },
+                  body_md: { type: "string" },
+                  tags: { type: "array", items: { type: "string" } }
+                }
+              }
+            }}
+          },
+          responses: { "200": { description: "Updated" } }
+        }
+      },
+      "/list-docs": {
+        get: {
+          operationId: "listDocs",
+          summary: "List recent docs in a project",
+          parameters: [
+            { in: "query", name: "project_id", required: true, schema: { type: "string" } },
+            { in: "query", name: "limit", required: false, schema: { type: "integer", default: 25 } }
+          ],
+          responses: { "200": { description: "Document list" } }
+        }
+      }
+    },
+    components: {
+      securitySchemes: {
+        bearerAuth: { type: "http", scheme: "bearer", bearerFormat: "JWT" }
+      }
+    }
+  });
+});
 const PORT = process.env.PORT || 8787
 app.listen(PORT, () => console.log(`API running on :${PORT}`))

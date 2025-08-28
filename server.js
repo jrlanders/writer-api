@@ -71,22 +71,38 @@ app.post('/clear-default-project', requireAuth, (_req, res) => {
 
 // ---------- Helpers ----------
 async function resolveProjectId(project_id, project_name) {
-  // explicit id
-  if (project_id) return project_id
-  // explicit name
-  if (project_name) {
-    const { rows } = await pool.query(`SELECT id FROM projects WHERE name = $1`, [project_name])
-    if (!rows.length) throw new Error(`Project not found: ${project_name}`)
-    return rows[0].id
+  const pid = project_id?.trim();
+  const pname = project_name?.trim();
+
+  // 1) explicit id
+  if (pid) return pid;
+
+  // 2) explicit name (case-insensitive)
+  if (pname) {
+    const { rows } = await pool.query(
+      `SELECT id FROM projects WHERE lower(name) = lower($1)`,
+      [pname]
+    );
+    if (!rows.length) throw new Error(`Project not found: ${pname}`);
+    return rows[0].id;
   }
-  // session defaults
-  if (defaultProjectId) return defaultProjectId
+
+  // 3) session defaults
+  if (defaultProjectId) return defaultProjectId;
+
   if (defaultProjectName) {
-    const { rows } = await pool.query(`SELECT id FROM projects WHERE name = $1`, [defaultProjectName])
-    if (!rows.length) throw new Error(`Default project not found: ${defaultProjectName}`)
-    return rows[0].id
+    const { rows } = await pool.query(
+      `SELECT id FROM projects WHERE lower(name) = lower($1)`,
+      [defaultProjectName]
+    );
+    if (!rows.length) throw new Error(`Default project not found: ${defaultProjectName}`);
+    return rows[0].id;
   }
-  throw new Error('Need project_id or project_name (no default set)')
+
+  // 4) nothing to go on
+  const err = new Error('Need project_id or project_name (no default set)');
+  err.statusCode = 400; // optional hint for callers
+  throw err;
 }
 
 async function retrieveTopK(projectId, query, k = 8) {

@@ -36,6 +36,16 @@ const pool = new Pool({
 })
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY })
 
+
+// ✅ ADD THE RESOLVER *HERE* (above routes)
+async function resolveProjectId(project_id, project_name) {
+  if (project_id) return project_id
+  if (!project_name) throw new Error('Need project_id or project_name')
+  const { rows } = await pool.query(`SELECT id FROM projects WHERE name = $1`, [project_name])
+  if (!rows.length) throw new Error(`Project not found: ${project_name}`)
+  return rows[0].id
+}
+
 async function retrieveTopK(projectId, query, k = 8) {
   const emb = await openai.embeddings.create({ model: MODEL_EMBED, input: query })
   const vec = emb.data[0].embedding
@@ -55,17 +65,25 @@ async function retrieveTopK(projectId, query, k = 8) {
 app.post('/ask', async (req, res) => {
   try {
     const { question, project_id, project_name = 'My Project', history = [] } = req.body || {}
-    if (!question || !project_id) return res.status(400).json({ error: 'question & project_id required' })
+    if (!question) {
+      return res.status(400).json({ error: 'question required' })
+    }
 
-    const ctx = await retrieveTopK(project_id, question, 8)
+    // 🔑 Resolve to a UUID, works with project_id or project_name
+    const pid = await resolveProjectId(project_id, project_name)
+
+    // Fetch context
+    const ctx = await retrieveTopK(pid, question, 8)
     const contextBlock = ctx.map((r, i) => `[${i + 1}] ${r.chunk_text}`).join('\n\n')
 
+    // Build chat messages
     const messages = [
       { role: 'system', content: `You are James's private writing assistant for "${project_name}". Use only the provided context. Maintain continuity and Writing-from-the-Middle.` },
       ...history,
       { role: 'user', content: `Context:\n${contextBlock}\n\nQuestion: ${question}` }
     ]
 
+    // Ask OpenAI
     const resp = await openai.chat.completions.create({
       model: MODEL_CHAT,
       messages,
@@ -121,10 +139,15 @@ app.post('/ask-stream', async (req, res) => {
 // ---------- WRITE: save a new doc + embed ----------
 app.post('/ingest', requireAuth, async (req, res) => {
   try {
-    const { project_id, doc_type, title, body_md, tags = [] } = req.body || {}
+    const { project_id: rawId, project_name, doc_type, title, body_md, tags = [] } = req.body || {}
+
+    const project_id = await resolveProjectId({ project_id: rawId, project_name })
     if (!project_id || !doc_type || !title || !body_md) {
-      return res.status(400).json({ error: 'project_id, doc_type, title, body_md required' })
+      return res.status(400).json({ error: 'project_id OR project_name, plus doc_type, title, body_md required' })
     }
+
+    // Resolve to UUID (works with name or id)
+    const pid = await resolveProjectId(project_id, project_name)
 
     // Insert the document
     const insertDocSQL = `
@@ -132,10 +155,10 @@ app.post('/ingest', requireAuth, async (req, res) => {
       VALUES ($1,$2,$3,$4,$5, now(), now())
       RETURNING id
     `
-    const { rows } = await pool.query(insertDocSQL, [project_id, doc_type, title, body_md, tags])
+    const { rows } = await pool.query(insertDocSQL, [pid, doc_type, title, body_md, tags])
     const doc_id = rows[0].id
 
-    // Chunk text (simple: split on blank lines; you can swap to your fancier chunker later)
+    // Chunk text (simple: split on blank lines)
     const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean)
     const chunks = paragraphs.length ? paragraphs : [body_md]
 
@@ -144,12 +167,11 @@ app.post('/ingest', requireAuth, async (req, res) => {
       const batch = chunks.slice(i, i + 16)
       const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch })
       for (let j = 0; j < batch.length; j++) {
-        const vec = resp.data[j].embedding
-        const vecStr = `[${vec.map(v => v.toFixed(8)).join(',')}]`  // pgvector literal
+        const vecStr = `[${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]` // pgvector literal
         await pool.query(
           `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
            VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
-          [project_id, doc_id, i + j + 1, batch[j], vecStr, JSON.stringify({ title, doc_type })]
+          [pid, doc_id, i + j + 1, batch[j], vecStr, JSON.stringify({ title, doc_type })]
         )
       }
     }
@@ -164,10 +186,15 @@ app.post('/ingest', requireAuth, async (req, res) => {
 // ---------- WRITE: update an existing doc (and re-embed if body changed) ----------
 app.post('/update', requireAuth, async (req, res) => {
   try {
-    const { document_id, project_id, title, body_md, tags } = req.body || {}
+    const { document_id, project_id: rawId, project_name, title, body_md, tags } = req.body || {}
+
+    const project_id = await resolveProjectId({ project_id: rawId, project_name })
     if (!document_id || !project_id || (!title && !body_md && !tags)) {
-      return res.status(400).json({ error: 'document_id, project_id and at least one of title/body_md/tags required' })
+      return res.status(400).json({ error: 'document_id, project_id/project_name and at least one of title/body_md/tags required' })
     }
+
+    // Resolve to UUID (works with name or id)
+    const pid = await resolveProjectId(project_id, project_name)
 
     // Build dynamic UPDATE
     const sets = []
@@ -177,12 +204,16 @@ app.post('/update', requireAuth, async (req, res) => {
     if (body_md) { sets.push(`body_md = $${idx++}`); vals.push(body_md) }
     if (tags)    { sets.push(`tags = $${idx++}`);    vals.push(tags) }
     sets.push(`updated_at = now()`)
-    vals.push(project_id, document_id)
+    vals.push(pid, document_id)
 
-    await pool.query(
+    // Apply update
+    const { rowCount } = await pool.query(
       `UPDATE documents SET ${sets.join(', ')} WHERE project_id = $${idx++} AND id = $${idx}`,
       vals
     )
+    if (rowCount === 0) {
+      return res.status(404).json({ error: 'Document not found for this project' })
+    }
 
     // If body changed, re-embed
     if (body_md) {
@@ -195,18 +226,17 @@ app.post('/update', requireAuth, async (req, res) => {
         const batch = chunks.slice(i, i + 16)
         const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch })
         for (let j = 0; j < batch.length; j++) {
-          const vec = resp.data[j].embedding
-          const vecStr = `[${vec.map(v => v.toFixed(8)).join(',')}]`
+          const vecStr = `[${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]`
           await pool.query(
             `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
              VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
-            [project_id, document_id, i + j + 1, batch[j], vecStr, JSON.stringify({ title: title ?? '(updated)', doc_type: 'update' })]
+            [pid, document_id, i + j + 1, batch[j], vecStr, JSON.stringify({ title: title ?? '(updated)', doc_type: 'update' })]
           )
         }
       }
     }
 
-    res.json({ ok: true })
+    res.json({ ok: true, document_id })
   } catch (e) {
     console.error(e)
     res.status(500).json({ error: String(e) })

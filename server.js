@@ -291,5 +291,62 @@ app.get('/list-docs', async (req, res) => {
     res.status(500).json({ error: String(e) });
   }
 });
+app.post('/update-by-title', requireAuth, async (req, res) => {
+  try {
+    const { project_id, title, body_md, tags } = req.body || {};
+    if (!project_id || !title || (!body_md && !tags)) {
+      return res.status(400).json({ error: 'project_id, title and at least one of body_md/tags required' });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT id FROM documents WHERE project_id = $1 AND title = $2 ORDER BY updated_at DESC LIMIT 1`,
+      [project_id, title]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Document not found' });
+
+    const document_id = rows[0].id;
+
+    const sets = []; const vals = []; let idx = 1;
+    if (body_md) { sets.push(`body_md = $${idx++}`); vals.push(body_md); }
+    if (tags)    { sets.push(`tags = $${idx++}`);    vals.push(tags); }
+    sets.push(`updated_at = now()`); vals.push(project_id, document_id);
+
+    await pool.query(`UPDATE documents SET ${sets.join(', ')} WHERE project_id = $${idx++} AND id = $${idx}`, vals);
+
+    if (body_md) {
+      await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id]);
+      const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+      const chunks = paragraphs.length ? paragraphs : [body_md];
+      for (let i = 0; i < chunks.length; i += 16) {
+        const batch = chunks.slice(i, i + 16);
+        const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch });
+        for (let j = 0; j < batch.length; j++) {
+          const vec = resp.data[j].embedding;
+          const vecStr = `[${vec.map(v => v.toFixed(8)).join(',')}]`;
+          await pool.query(
+            `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
+             VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
+            [project_id, document_id, i + j + 1, batch[j], vecStr, JSON.stringify({ title, doc_type: 'update' })]
+          );
+        }
+      }
+    }
+    res.json({ ok: true, document_id });
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+app.get('/list-docs', async (req, res) => {
+  try {
+    const { project_id } = req.query;
+    const limit = Math.min(parseInt(req.query.limit || '25', 10), 100);
+    if (!project_id) return res.status(400).json({ error: 'project_id required' });
+    const { rows } = await pool.query(
+      `SELECT id, title, doc_type, tags, created_at, updated_at
+       FROM documents WHERE project_id = $1 ORDER BY updated_at DESC LIMIT $2`,
+      [project_id, limit]
+    );
+    res.json({ items: rows });
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
 const PORT = process.env.PORT || 8787
 app.listen(PORT, () => console.log(`API running on :${PORT}`))

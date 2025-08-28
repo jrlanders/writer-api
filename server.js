@@ -360,7 +360,7 @@ app.get('/doc-by-title', async (req, res) => {
 app.get('/openapi.json', (_req, res) => {
   res.json({
     openapi: "3.1.0",
-    info: { title: "Writer Brain API", version: "1.2.0" },
+    info: { title: "Writer Brain API", version: "1.3.0" },
     servers: [{ url: "https://writer-api-p0c7.onrender.com" }],
     paths: {
       "/ask": {
@@ -399,39 +399,43 @@ app.get('/openapi.json', (_req, res) => {
       },
 
       "/ingest": {
-        post: {
-          operationId: "ingestDoc",
-          summary: "Create a new document and embed it",
-          security: [{ bearerAuth: [] }],
-          requestBody: {
-            required: true,
-            content: {
+        "post": {
+          "operationId": "ingestDoc",
+          "summary": "Create a new document and embed it",
+          "security": [{ "bearerAuth": [] }],
+          "requestBody": {
+            "required": true,
+            "content": {
               "application/json": {
-                schema: {
-                  type: "object",
-                  required: ["doc_type","title","body_md"],
-                  properties: {
-                    project_id: { type: "string" },
-                    project_name: { type: "string" },
-                    doc_type: { type: "string", example: "note" },
-                    title: { type: "string" },
-                    body_md: { type: "string" },
-                    tags: { type: "array", items: { type: "string" } }
-                  }
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id":   { "type": "string", "description": "UUID of project" },
+                    "project_name": { "type": "string", "description": "Human-friendly name if you don't have the UUID" },
+                    "doc_type":     { "type": "string", "example": "artifact", "description": "character | chapter | scene | concept | artifact | location | ..." },
+                    "title":        { "type": "string" },
+                    "body_md":      { "type": "string" },
+                    "tags":         { "type": "array", "items": { "type": "string" } }
+                  },
+                  "required": ["doc_type","title","body_md"],
+                  "oneOf": [
+                    { "required": ["project_id"] },
+                    { "required": ["project_name"] }
+                  ]
                 }
               }
             }
           },
-          responses: {
+          "responses": {
             "200": {
-              description: "Ingested",
-              content: {
+              "description": "Ingested",
+              "content": {
                 "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      ok: { type: "boolean" },
-                      document_id: { type: "string", format: "uuid" }
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "ok":          { "type": "boolean" },
+                      "document_id": { "type": "string", "format": "uuid" }
                     }
                   }
                 }
@@ -442,57 +446,99 @@ app.get('/openapi.json', (_req, res) => {
       },
 
       "/update": {
-        post: {
-          operationId: "updateDoc",
-          summary: "Update an existing document by UUID and re-embed",
-          security: [{ bearerAuth: [] }],
-          requestBody: {
-            required: true,
-            content: {
+        "post": {
+          "operationId": "updateDoc",
+          "summary": "Update an existing document by UUID and re-embed",
+          "security": [
+            { "bearerAuth": [] }
+          ],
+          "requestBody": {
+            "required": true,
+            "content": {
               "application/json": {
-                schema: {
-                  type: "object",
-                  required: ["document_id"],
-                  properties: {
-                    project_id: { type: "string" },
-                    project_name: { type: "string" },
-                    document_id: { type: "string", format: "uuid" },
-                    title: { type: "string" },
-                    body_md: { type: "string" },
-                    tags: { type: "array", items: { type: "string" } }
-                  }
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id":   { "type": "string", "description": "UUID of project" },
+                    "project_name": { "type": "string", "description": "Human-friendly name if you don't have the UUID" },
+                    "document_id":  { "type": "string", "format": "uuid" },
+                    "title":        { "type": "string" },
+                    "body_md":      { "type": "string" },
+                    "tags":         { "type": "array", "items": { "type": "string" } }
+                  },
+                  "required": ["document_id"],
+                  "oneOf": [
+                    { "required": ["project_id","document_id"] },
+                    { "required": ["project_name","document_id"] }
+                  ]
                 }
               }
             }
           },
-          responses: { "200": { description: "Updated" } }
+          "responses": {
+            "200": {
+              "description": "Updated",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "ok":          { "type": "boolean" },
+                      "document_id": { "type": "string", "format": "uuid" }
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       },
 
       "/update-by-title": {
-        post: {
-          operationId: "updateDocByTitle",
-          summary: "Update a document by title (no UUID) and re-embed",
-          security: [{ bearerAuth: [] }],
-          requestBody: {
-            required: true,
-            content: {
+        "post": {
+          "operationId": "updateDocByTitle",
+          "summary": "Update a document by title (no UUID) and re-embed",
+          "security": [
+            { "bearerAuth": [] }
+          ],
+          "requestBody": {
+            "required": true,
+            "content": {
               "application/json": {
-                schema: {
-                  type: "object",
-                  required: ["title"],
-                  properties: {
-                    project_id: { type: "string" },
-                    project_name: { type: "string" },
-                    title: { type: "string" },
-                    body_md: { type: "string" },
-                    tags: { type: "array", items: { type: "string" } }
-                  }
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id":   { "type": "string", "description": "UUID of project" },
+                    "project_name": { "type": "string", "description": "Human-friendly project name" },
+                    "title":        { "type": "string",  "description": "Document title to update" },
+                    "body_md":      { "type": "string" },
+                    "tags":         { "type": "array", "items": { "type": "string" } }
+                  },
+                  "required": ["title"],
+                  "oneOf": [
+                    { "required": ["project_id","title"] },
+                    { "required": ["project_name","title"] }
+                  ]
                 }
               }
             }
           },
-          responses: { "200": { description: "Updated" } }
+          "responses": {
+            "200": {
+              "description": "Updated",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "ok":          { "type": "boolean" },
+                      "document_id": { "type": "string", "format": "uuid" }
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       },
 
@@ -570,11 +616,10 @@ app.get('/openapi.json', (_req, res) => {
         }
       }
     },
-    components: {
-      securitySchemes: {
-        bearerAuth: { type: "http", scheme: "bearer", bearerFormat: "JWT" }
-      },
-      schemas: {}
+    "components": {
+      "securitySchemes": {
+        "bearerAuth": { "type": "http", "scheme": "bearer", "bearerFormat": "JWT" }
+      }
     }
   })
 })

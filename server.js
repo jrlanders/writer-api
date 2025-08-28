@@ -23,7 +23,10 @@ const requireAuth = (req, res, next) => {
 const DB_URL = process.env.DB_URL
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY
 const MODEL_EMBED = process.env.MODEL_EMBED || 'text-embedding-3-small' // 1536-dim
-const MODEL_CHAT  = process.env.MODEL_CHAT  || 'gpt-4o'
+const MODEL_CHAT
+const DEFAULT_PROJECT_ID   = process.env.DEFAULT_PROJECT_ID || null
+const DEFAULT_PROJECT_NAME = process.env.DEFAULT_PROJECT_NAME || null
+  = process.env.MODEL_CHAT  || 'gpt-4o'
 
 if (!DB_URL || !OPENAI_API_KEY) {
   console.error('Missing DB_URL or OPENAI_API_KEY')

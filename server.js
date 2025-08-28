@@ -469,5 +469,59 @@ app.get('/openapi.json', (_req, res) => {
     }
   });
 });
+// ---------- GPT Actions spec ----------
+app.get('/openapi.json', (_req, res) => {
+  res.json({
+    openapi: "3.0.3",
+    info: { title: "Writer Brain API", version: "1.0.0" },
+    servers: [{ url: "https://writer-api-p0c7.onrender.com" }],
+    paths: {
+      "/ask": {
+        post: {
+          operationId: "askProject",
+          summary: "Retrieve an answer using RAG",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["question", "project_id"],
+                  properties: {
+                    question: { type: "string" },
+                    project_id: { type: "string" }
+                  }
+                }
+              }
+            }
+          },
+          responses: {
+            "200": {
+              description: "Answer JSON",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      answer: { type: "string" },
+                      used_context: { type: "array", items: { type: "object" } }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      // … add /ingest, /update, etc. same way
+    },
+    components: {
+      securitySchemes: {
+        bearerAuth: { type: "http", scheme: "bearer" }
+      },
+      schemas: {}
+    }
+  });
+});
 const PORT = process.env.PORT || 8787
 app.listen(PORT, () => console.log(`API running on :${PORT}`))

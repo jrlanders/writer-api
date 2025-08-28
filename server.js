@@ -23,10 +23,11 @@ const requireAuth = (req, res, next) => {
 const DB_URL = process.env.DB_URL
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY
 const MODEL_EMBED = process.env.MODEL_EMBED || 'text-embedding-3-small' // 1536-dim
-const MODEL_CHAT
+const MODEL_CHAT  = process.env.MODEL_CHAT  || 'gpt-4o'
+
+// Persistent default project (env fallback)
 const DEFAULT_PROJECT_ID   = process.env.DEFAULT_PROJECT_ID || null
 const DEFAULT_PROJECT_NAME = process.env.DEFAULT_PROJECT_NAME || null
-  = process.env.MODEL_CHAT  || 'gpt-4o'
 
 if (!DB_URL || !OPENAI_API_KEY) {
   console.error('Missing DB_URL or OPENAI_API_KEY')
@@ -37,10 +38,12 @@ const pool = new Pool({ connectionString: DB_URL, ssl: { rejectUnauthorized: fal
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY })
 
 // Build tag / health
-const APP_BUILD = '2025-08-27-session-default-project-1.4.0'
+const APP_BUILD = '2025-08-28-session-defaults-1.4.3'
 app.get('/health', (_req, res) => res.json({ ok: true, build: APP_BUILD }))
 
 // ---------- Session default project (Option C) ----------
+// In-memory session default (set via /set-default-project).
+// These are cleared on process restart; resolver also falls back to env defaults above.
 let defaultProjectId = null
 let defaultProjectName = null
 
@@ -54,8 +57,8 @@ app.post('/set-default-project', requireAuth, async (req, res) => {
       defaultProjectId = project_id
       defaultProjectName = null
     } else {
-      // verify it exists
-      const { rows } = await pool.query(`SELECT id FROM projects WHERE name = $1`, [project_name])
+      // verify it exists (case-insensitive)
+      const { rows } = await pool.query(`SELECT id FROM projects WHERE lower(name) = lower($1)`, [project_name])
       if (!rows.length) return res.status(404).json({ error: `Project not found: ${project_name}` })
       defaultProjectName = project_name
       defaultProjectId = null
@@ -74,38 +77,61 @@ app.post('/clear-default-project', requireAuth, (_req, res) => {
 
 // ---------- Helpers ----------
 async function resolveProjectId(project_id, project_name) {
-  const pid = project_id?.trim();
-  const pname = project_name?.trim();
+  const pid = (project_id || '').trim()
+  const pname = (project_name || '').trim()
 
   // 1) explicit id
-  if (pid) return pid;
+  if (pid) return pid
 
   // 2) explicit name (case-insensitive)
   if (pname) {
     const { rows } = await pool.query(
       `SELECT id FROM projects WHERE lower(name) = lower($1)`,
       [pname]
-    );
-    if (!rows.length) throw new Error(`Project not found: ${pname}`);
-    return rows[0].id;
+    )
+    if (!rows.length) {
+      const err = new Error(`Project not found: ${pname}`)
+      err.statusCode = 404
+      throw err
+    }
+    return rows[0].id
   }
 
-  // 3) session defaults
-  if (defaultProjectId) return defaultProjectId;
+  // 3) in-memory session defaults (if set via /set-default-project)
+  if (defaultProjectId) return defaultProjectId
 
   if (defaultProjectName) {
     const { rows } = await pool.query(
       `SELECT id FROM projects WHERE lower(name) = lower($1)`,
       [defaultProjectName]
-    );
-    if (!rows.length) throw new Error(`Default project not found: ${defaultProjectName}`);
-    return rows[0].id;
+    )
+    if (!rows.length) {
+      const err = new Error(`Default project not found: ${defaultProjectName}`)
+      err.statusCode = 404
+      throw err
+    }
+    return rows[0].id
   }
 
-  // 4) nothing to go on
-  const err = new Error('Need project_id or project_name (no default set)');
-  err.statusCode = 400; // optional hint for callers
-  throw err;
+  // 4) env defaults (persist across restarts)
+  if (DEFAULT_PROJECT_ID) return DEFAULT_PROJECT_ID
+  if (DEFAULT_PROJECT_NAME) {
+    const { rows } = await pool.query(
+      `SELECT id FROM projects WHERE lower(name) = lower($1)`,
+      [DEFAULT_PROJECT_NAME]
+    )
+    if (!rows.length) {
+      const err = new Error(`Env default project not found: ${DEFAULT_PROJECT_NAME}`)
+      err.statusCode = 404
+      throw err
+    }
+    return rows[0].id
+  }
+
+  // 5) nothing to go on
+  const err = new Error('Need project_id or project_name (no default set)')
+  err.statusCode = 400
+  throw err
 }
 
 async function retrieveTopK(projectId, query, k = 8) {
@@ -128,7 +154,7 @@ app.post('/project', requireAuth, async (req, res) => {
   try {
     const { name, description = null } = req.body || {}
     if (!name) return res.status(400).json({ error: 'name required' })
-    const look = await pool.query(`SELECT id FROM projects WHERE name = $1`, [name])
+    const look = await pool.query(`SELECT id FROM projects WHERE lower(name) = lower($1)`, [name])
     if (look.rows.length) return res.json({ project_id: look.rows[0].id, name })
     const ins = await pool.query(
       `INSERT INTO projects (name, description) VALUES ($1,$2) RETURNING id`,
@@ -163,7 +189,7 @@ app.post('/ask', async (req, res) => {
     const ctx = await retrieveTopK(pid, question, 8)
     const contextBlock = ctx.map((r, i) => `[${i + 1}] ${r.chunk_text}`).join('\n\n')
 
-    const projLabel = project_name || defaultProjectName || 'My Project'
+    const projLabel = project_name || defaultProjectName || DEFAULT_PROJECT_NAME || 'My Project'
     const messages = [
       { role: 'system', content: `You are James's private writing assistant for "${projLabel}". Use only the provided context. Maintain continuity and Writing-from-the-Middle.` },
       ...history,
@@ -177,7 +203,8 @@ app.post('/ask', async (req, res) => {
     })
     res.json({ answer: resp.choices[0].message.content, used_context: ctx })
   } catch (e) {
-    res.status(500).json({ error: String(e) })
+    const code = e.statusCode || 500
+    res.status(code).json({ error: String(e.message || e) })
   }
 })
 
@@ -198,7 +225,7 @@ app.post('/ask-stream', async (req, res) => {
       'Access-Control-Allow-Origin':'*'
     })
 
-    const projLabel = project_name || defaultProjectName || 'My Project'
+    const projLabel = project_name || defaultProjectName || DEFAULT_PROJECT_NAME || 'My Project'
     const messages = [
       { role:'system', content:`You are James's private writing assistant for "${projLabel}". Use only the provided context. Maintain continuity and Writing-from-the-Middle.` },
       ...history,
@@ -217,7 +244,7 @@ app.post('/ask-stream', async (req, res) => {
     res.write(`data:${JSON.stringify({ done:true, used_context: ctx })}\n\n`)
     res.end()
   } catch (e) {
-    res.write(`data:${JSON.stringify({ error:String(e) })}\n\n`)
+    res.write(`data:${JSON.stringify({ error:String(e.message || e) })}\n\n`)
     res.end()
   }
 })
@@ -257,7 +284,8 @@ app.post('/ingest', requireAuth, async (req, res) => {
 
     res.json({ ok: true, document_id: doc_id })
   } catch (e) {
-    res.status(500).json({ error: String(e) })
+    const code = e.statusCode || 500
+    res.status(code).json({ error: String(e.message || e) })
   }
 })
 
@@ -266,7 +294,7 @@ app.post('/update', requireAuth, async (req, res) => {
   try {
     const { document_id, project_id, project_name, title, body_md, tags } = req.body || {}
     if (!document_id || (!title && !body_md && !tags)) {
-      return res.status(400).json({ error: 'document_id and one of title/body_md/tags required (plus project_id or project_name or a default must be set)' })
+      return res.status(400).json({ error: 'document_id and one of title/body_md/tags required (plus project_id or project_name)' })
     }
     const pid = await resolveProjectId(project_id, project_name)
 
@@ -304,7 +332,8 @@ app.post('/update', requireAuth, async (req, res) => {
 
     res.json({ ok: true, document_id })
   } catch (e) {
-    res.status(500).json({ error: String(e) })
+    const code = e.statusCode || 500
+    res.status(code).json({ error: String(e.message || e) })
   }
 })
 
@@ -313,7 +342,7 @@ app.post('/update-by-title', requireAuth, async (req, res) => {
   try {
     const { project_id, project_name, title, body_md, tags } = req.body || {}
     if (!title || (!body_md && !tags)) {
-      return res.status(400).json({ error: 'title and one of body_md/tags required (plus project_id or project_name or a default must be set)' })
+      return res.status(400).json({ error: 'title and one of body_md/tags required (plus project_id or project_name)' })
     }
     const pid = await resolveProjectId(project_id, project_name)
 
@@ -351,10 +380,12 @@ app.post('/update-by-title', requireAuth, async (req, res) => {
 
     res.json({ ok: true, document_id })
   } catch (e) {
-    res.status(500).json({ error: String(e) })
+    const code = e.statusCode || 500
+    res.status(code).json({ error: String(e.message || e) })
   }
 })
 
+// ---------- LIST DOCS (filters) ----------
 app.get('/list-docs', async (req, res) => {
   try {
     const { project_id, project_name, doc_type, q } = req.query
@@ -377,7 +408,8 @@ app.get('/list-docs', async (req, res) => {
     )
     res.json({ items: rows })
   } catch (e) {
-    res.status(500).json({ error: String(e) })
+    const code = e.statusCode || 500
+    res.status(code).json({ error: String(e.message || e) })
   }
 })
 
@@ -396,7 +428,8 @@ app.get('/doc', async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: 'Document not found' })
     res.json(rows[0])
   } catch (e) {
-    res.status(500).json({ error: String(e) })
+    const code = e.statusCode || 500
+    res.status(code).json({ error: String(e.message || e) })
   }
 })
 
@@ -417,7 +450,8 @@ app.get('/doc-by-title', async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: 'Document not found' })
     res.json(rows[0])
   } catch (e) {
-    res.status(500).json({ error: String(e) })
+    const code = e.statusCode || 500
+    res.status(code).json({ error: String(e.message || e) })
   }
 })
 
@@ -425,14 +459,13 @@ app.get('/doc-by-title', async (req, res) => {
 app.get('/openapi.json', (_req, res) => {
   res.json({
     openapi: "3.1.0",
-    info: { title: "Writer Brain API", version: "1.4.0" }, // bumped to force re-fetch
+    info: { title: "Writer Brain API", version: "1.4.3" },
     servers: [{ url: "https://writer-api-p0c7.onrender.com" }],
     paths: {
       "/ask": {
         post: {
           operationId: "askProject",
           summary: "Retrieve an answer using RAG",
-          description: "If no project_id/project_name is supplied, the API uses the active default project set via /set-default-project.",
           requestBody: {
             required: true,
             content: {
@@ -442,8 +475,8 @@ app.get('/openapi.json', (_req, res) => {
                   required: ["question"],
                   properties: {
                     question: { type: "string" },
-                    project_id: { type: "string", description: "Optional when a default project is set" },
-                    project_name: { type: "string", description: "Optional when a default project is set" },
+                    project_id: { type: "string" },
+                    project_name: { type: "string" },
                     history: {
                       type: "array",
                       items: {
@@ -463,12 +496,10 @@ app.get('/openapi.json', (_req, res) => {
           responses: { "200": { description: "Answer JSON" } }
         }
       },
-
       "/ingest": {
         post: {
           operationId: "ingestDoc",
           summary: "Create a new document and embed it",
-          description: "If no project_id/project_name is supplied, the API uses the active default project set via /set-default-project.",
           security: [{ bearerAuth: [] }],
           requestBody: {
             required: true,
@@ -477,14 +508,18 @@ app.get('/openapi.json', (_req, res) => {
                 schema: {
                   type: "object",
                   properties: {
-                    project_id:   { type: "string", description: "Optional when a default project is set" },
-                    project_name: { type: "string", description: "Optional when a default project is set" },
+                    project_id:   { type: "string", description: "UUID of project" },
+                    project_name: { type: "string", description: "Human-friendly name if you don't have the UUID" },
                     doc_type:     { type: "string", example: "artifact", description: "character | chapter | scene | concept | artifact | location | ..." },
                     title:        { type: "string" },
                     body_md:      { type: "string" },
                     tags:         { type: "array", items: { type: "string" } }
                   },
-                  required: ["doc_type","title","body_md"]
+                  required: ["doc_type","title","body_md"],
+                  oneOf: [
+                    { required: ["project_id"] },
+                    { required: ["project_name"] }
+                  ]
                 }
               }
             }
@@ -507,12 +542,10 @@ app.get('/openapi.json', (_req, res) => {
           }
         }
       },
-
       "/update": {
         post: {
           operationId: "updateDoc",
           summary: "Update an existing document by UUID and re-embed",
-          description: "If no project_id/project_name is supplied, the API uses the active default project set via /set-default-project.",
           security: [{ bearerAuth: [] }],
           requestBody: {
             required: true,
@@ -521,14 +554,18 @@ app.get('/openapi.json', (_req, res) => {
                 schema: {
                   type: "object",
                   properties: {
-                    project_id:   { type: "string", description: "Optional when a default project is set" },
-                    project_name: { type: "string", description: "Optional when a default project is set" },
+                    project_id:   { type: "string", description: "UUID of project" },
+                    project_name: { type: "string", description: "Human-friendly name if you don't have the UUID" },
                     document_id:  { type: "string", format: "uuid" },
                     title:        { type: "string" },
                     body_md:      { type: "string" },
                     tags:         { type: "array", items: { type: "string" } }
                   },
-                  required: ["document_id"]
+                  required: ["document_id"],
+                  oneOf: [
+                    { required: ["project_id","document_id"] },
+                    { required: ["project_name","document_id"] }
+                  ]
                 }
               }
             }
@@ -551,12 +588,10 @@ app.get('/openapi.json', (_req, res) => {
           }
         }
       },
-
       "/update-by-title": {
         post: {
           operationId: "updateDocByTitle",
           summary: "Update a document by title (no UUID) and re-embed",
-          description: "If no project_id/project_name is supplied, the API uses the active default project set via /set-default-project.",
           security: [{ bearerAuth: [] }],
           requestBody: {
             required: true,
@@ -565,13 +600,17 @@ app.get('/openapi.json', (_req, res) => {
                 schema: {
                   type: "object",
                   properties: {
-                    project_id:   { type: "string", description: "Optional when a default project is set" },
-                    project_name: { type: "string", description: "Optional when a default project is set" },
+                    project_id:   { type: "string", description: "UUID of project" },
+                    project_name: { type: "string", description: "Human-friendly project name" },
                     title:        { type: "string", description: "Document title to update" },
                     body_md:      { type: "string" },
                     tags:         { type: "array", items: { type: "string" } }
                   },
-                  required: ["title"]
+                  required: ["title"],
+                  oneOf: [
+                    { required: ["project_id","title"] },
+                    { required: ["project_name","title"] }
+                  ]
                 }
               }
             }
@@ -594,7 +633,6 @@ app.get('/openapi.json', (_req, res) => {
           }
         }
       },
-
       "/doc": {
         get: {
           operationId: "getDoc",
@@ -605,37 +643,32 @@ app.get('/openapi.json', (_req, res) => {
           responses: { "200": { description: "Document" } }
         }
       },
-
       "/doc-by-title": {
         get: {
           operationId: "getDocByTitle",
           summary: "Get latest doc by title (by project name or id)",
-          description: "If no project_id/project_name is supplied, the API uses the active default project set via /set-default-project.",
           parameters: [
-            { in: "query", name: "project_id",   required: false, schema: { type: "string" } },
+            { in: "query", name: "project_id", required: false, schema: { type: "string" } },
             { in: "query", name: "project_name", required: false, schema: { type: "string" } },
-            { in: "query", name: "title",        required: true,  schema: { type: "string" } }
+            { in: "query", name: "title", required: true, schema: { type: "string" } }
           ],
           responses: { "200": { description: "Document" } }
         }
       },
-
       "/list-docs": {
         get: {
           operationId: "listDocs",
           summary: "List recent docs in a project",
-          description: "If no project_id/project_name is supplied, the API uses the active default project set via /set-default-project.",
           parameters: [
             { in: "query", name: "project_id",   required: false, schema: { type: "string" } },
             { in: "query", name: "project_name", required: false, schema: { type: "string" } },
-            { in: "query", name: "doc_type",     required: false, schema: { type: "string" }, description: "Filter by doc_type (e.g., character, note, chapter, artifact, concept)" },
+            { in: "query", name: "doc_type",     required: false, schema: { type: "string" }, description: "Filter by doc_type (e.g., character, note, chapter)" },
             { in: "query", name: "q",            required: false, schema: { type: "string" }, description: "Search in title or tags (ILIKE)" },
             { in: "query", name: "limit",        required: false, schema: { type: "integer", default: 25, minimum: 1, maximum: 100 } }
           ],
           responses: { "200": { description: "Document list" } }
         }
       },
-
       "/projects": {
         get: {
           operationId: "listProjects",
@@ -644,7 +677,6 @@ app.get('/openapi.json', (_req, res) => {
           responses: { "200": { description: "Projects" } }
         }
       },
-
       "/project": {
         post: {
           operationId: "createOrGetProject",
@@ -673,10 +705,11 @@ app.get('/openapi.json', (_req, res) => {
       securitySchemes: {
         bearerAuth: { type: "http", scheme: "bearer", bearerFormat: "JWT" }
       },
-      schemas: {} // keep as an object (even empty) to satisfy validators
+      schemas: {}
     }
   })
 })
 
+// ---- Start ----
 const PORT = process.env.PORT || 8787
 app.listen(PORT, () => console.log(`API running on :${PORT}`))

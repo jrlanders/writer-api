@@ -34,16 +34,59 @@ const pool = new Pool({ connectionString: DB_URL, ssl: { rejectUnauthorized: fal
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY })
 
 // Build tag / health
-const APP_BUILD = '2025-08-28-openapi-1.3.2'
+const APP_BUILD = '2025-08-27-session-default-project-1.4.0'
 app.get('/health', (_req, res) => res.json({ ok: true, build: APP_BUILD }))
+
+// ---------- Session default project (Option C) ----------
+let defaultProjectId = null
+let defaultProjectName = null
+
+app.post('/set-default-project', requireAuth, async (req, res) => {
+  try {
+    const { project_id, project_name } = req.body || {}
+    if (!project_id && !project_name) {
+      return res.status(400).json({ error: 'project_id or project_name required' })
+    }
+    if (project_id) {
+      defaultProjectId = project_id
+      defaultProjectName = null
+    } else {
+      // verify it exists
+      const { rows } = await pool.query(`SELECT id FROM projects WHERE name = $1`, [project_name])
+      if (!rows.length) return res.status(404).json({ error: `Project not found: ${project_name}` })
+      defaultProjectName = project_name
+      defaultProjectId = null
+    }
+    res.json({ ok: true, defaultProjectId, defaultProjectName })
+  } catch (e) {
+    res.status(500).json({ error: String(e) })
+  }
+})
+
+app.post('/clear-default-project', requireAuth, (_req, res) => {
+  defaultProjectId = null
+  defaultProjectName = null
+  res.json({ ok: true, message: 'Default project cleared' })
+})
 
 // ---------- Helpers ----------
 async function resolveProjectId(project_id, project_name) {
+  // explicit id
   if (project_id) return project_id
-  if (!project_name) throw new Error('Need project_id or project_name')
-  const { rows } = await pool.query(`SELECT id FROM projects WHERE name = $1`, [project_name])
-  if (!rows.length) throw new Error(`Project not found: ${project_name}`)
-  return rows[0].id
+  // explicit name
+  if (project_name) {
+    const { rows } = await pool.query(`SELECT id FROM projects WHERE name = $1`, [project_name])
+    if (!rows.length) throw new Error(`Project not found: ${project_name}`)
+    return rows[0].id
+  }
+  // session defaults
+  if (defaultProjectId) return defaultProjectId
+  if (defaultProjectName) {
+    const { rows } = await pool.query(`SELECT id FROM projects WHERE name = $1`, [defaultProjectName])
+    if (!rows.length) throw new Error(`Default project not found: ${defaultProjectName}`)
+    return rows[0].id
+  }
+  throw new Error('Need project_id or project_name (no default set)')
 }
 
 async function retrieveTopK(projectId, query, k = 8) {
@@ -94,15 +137,16 @@ app.get('/projects', requireAuth, async (_req, res) => {
 // ---------- READ: answer questions ----------
 app.post('/ask', async (req, res) => {
   try {
-    const { question, project_id, project_name = 'My Project', history = [] } = req.body || {}
+    const { question, project_id, project_name = null, history = [] } = req.body || {}
     if (!question) return res.status(400).json({ error: 'question required' })
 
-    const pid = await resolveProjectId(project_id, project_name)
+    const pid = await resolveProjectId(project_id, project_name || undefined)
     const ctx = await retrieveTopK(pid, question, 8)
     const contextBlock = ctx.map((r, i) => `[${i + 1}] ${r.chunk_text}`).join('\n\n')
 
+    const projLabel = project_name || defaultProjectName || 'My Project'
     const messages = [
-      { role: 'system', content: `You are James's private writing assistant for "${project_name}". Use only the provided context. Maintain continuity and Writing-from-the-Middle.` },
+      { role: 'system', content: `You are James's private writing assistant for "${projLabel}". Use only the provided context. Maintain continuity and Writing-from-the-Middle.` },
       ...history,
       { role: 'user', content: `Context:\n${contextBlock}\n\nQuestion: ${question}` }
     ]
@@ -121,10 +165,10 @@ app.post('/ask', async (req, res) => {
 // ---------- READ (streaming): ChatGPT-style typing ----------
 app.post('/ask-stream', async (req, res) => {
   try {
-    const { question, project_id, project_name = 'My Project', history = [] } = req.body || {}
+    const { question, project_id, project_name = null, history = [] } = req.body || {}
     if (!question) return res.status(400).json({ error: 'question required' })
 
-    const pid = await resolveProjectId(project_id, project_name)
+    const pid = await resolveProjectId(project_id, project_name || undefined)
     const ctx = await retrieveTopK(pid, question, 8)
     const contextBlock = ctx.map((r,i)=>`[${i+1}] ${r.chunk_text}`).join('\n\n')
 
@@ -135,8 +179,9 @@ app.post('/ask-stream', async (req, res) => {
       'Access-Control-Allow-Origin':'*'
     })
 
+    const projLabel = project_name || defaultProjectName || 'My Project'
     const messages = [
-      { role:'system', content:`You are James's private writing assistant for "${project_name}". Use only the provided context. Maintain continuity and Writing-from-the-Middle.` },
+      { role:'system', content:`You are James's private writing assistant for "${projLabel}". Use only the provided context. Maintain continuity and Writing-from-the-Middle.` },
       ...history,
       { role:'user', content:`Context:\n${contextBlock}\n\nQuestion: ${question}` }
     ]
@@ -163,7 +208,7 @@ app.post('/ingest', requireAuth, async (req, res) => {
   try {
     const { project_id, project_name, doc_type, title, body_md, tags = [] } = req.body || {}
     if (!doc_type || !title || !body_md) {
-      return res.status(400).json({ error: 'doc_type, title, body_md required (plus project_id or project_name)' })
+      return res.status(400).json({ error: 'doc_type, title, body_md required (plus project_id or project_name or a default must be set)' })
     }
     const pid = await resolveProjectId(project_id, project_name)
 
@@ -202,7 +247,7 @@ app.post('/update', requireAuth, async (req, res) => {
   try {
     const { document_id, project_id, project_name, title, body_md, tags } = req.body || {}
     if (!document_id || (!title && !body_md && !tags)) {
-      return res.status(400).json({ error: 'document_id and one of title/body_md/tags required (plus project_id or project_name)' })
+      return res.status(400).json({ error: 'document_id and one of title/body_md/tags required (plus project_id or project_name or a default must be set)' })
     }
     const pid = await resolveProjectId(project_id, project_name)
 
@@ -249,7 +294,7 @@ app.post('/update-by-title', requireAuth, async (req, res) => {
   try {
     const { project_id, project_name, title, body_md, tags } = req.body || {}
     if (!title || (!body_md && !tags)) {
-      return res.status(400).json({ error: 'title and one of body_md/tags required (plus project_id or project_name)' })
+      return res.status(400).json({ error: 'title and one of body_md/tags required (plus project_id or project_name or a default must be set)' })
     }
     const pid = await resolveProjectId(project_id, project_name)
 
@@ -291,7 +336,6 @@ app.post('/update-by-title', requireAuth, async (req, res) => {
   }
 })
 
-// ---------- READ: list docs with filters ----------
 app.get('/list-docs', async (req, res) => {
   try {
     const { project_id, project_name, doc_type, q } = req.query
@@ -362,9 +406,41 @@ app.get('/doc-by-title', async (req, res) => {
 app.get('/openapi.json', (_req, res) => {
   res.json({
     openapi: "3.1.0",
-    info: { title: "Writer Brain API", version: "1.3.2" },
+    info: { title: "Writer Brain API", version: "1.4.0" },
     servers: [{ url: "https://writer-api-p0c7.onrender.com" }],
     paths: {
+      "/set-default-project": {
+        post: {
+          operationId: "setDefaultProject",
+          summary: "Set the default project for this server session",
+          security: [{ bearerAuth: [] }],
+          requestBody: {
+            required: true,
+            content: { "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  project_id: { type: "string" },
+                  project_name: { type: "string" }
+                },
+                oneOf: [
+                  { required: ["project_id"] },
+                  { required: ["project_name"] }
+                ]
+              }
+            } }
+          },
+          responses: { "200": { description: "OK" } }
+        }
+      },
+      "/clear-default-project": {
+        post: {
+          operationId: "clearDefaultProject",
+          summary: "Clear the default project",
+          security: [{ bearerAuth: [] }],
+          responses: { "200": { description: "OK" } }
+        }
+      },
       "/ask": {
         post: {
           operationId: "askProject",
@@ -377,8 +453,8 @@ app.get('/openapi.json', (_req, res) => {
                 required: ["question"],
                 properties: {
                   question: { type: "string" },
-                  project_id: { type: "string" },
-                  project_name: { type: "string" },
+                  project_id: { type: "string", description: "Optional if default set" },
+                  project_name: { type: "string", description: "Optional if default set" },
                   history: {
                     type: "array",
                     items: {
@@ -392,12 +468,11 @@ app.get('/openapi.json', (_req, res) => {
                   }
                 }
               }
-            }}
+            } }
           },
           responses: { "200": { description: "Answer JSON" } }
         }
       },
-
       "/ingest": {
         post: {
           operationId: "ingestDoc",
@@ -409,38 +484,28 @@ app.get('/openapi.json', (_req, res) => {
               schema: {
                 type: "object",
                 properties: {
-                  project_id:   { type: "string", description: "UUID of project" },
-                  project_name: { type: "string", description: "Human-friendly name if you don't have the UUID" },
+                  project_id:   { type: "string", description: "UUID of project (optional if default set)" },
+                  project_name: { type: "string", description: "Name of project (optional if default set)" },
                   doc_type:     { type: "string", example: "artifact", description: "character | chapter | scene | concept | artifact | location | ..." },
                   title:        { type: "string" },
                   body_md:      { type: "string" },
                   tags:         { type: "array", items: { type: "string" } }
                 },
-                required: ["doc_type","title","body_md"],
-                oneOf: [
-                  { required: ["project_id"] },
-                  { required: ["project_name"] }
-                ]
+                required: ["doc_type","title","body_md"]
               }
-            }}
+            } }
           },
           responses: {
             "200": {
               description: "Ingested",
-              content: { "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    ok: { type: "boolean" },
-                    document_id: { type: "string", format: "uuid" }
-                  }
-                }
-              }}
+              content: { "application/json": { schema: { type: "object", properties: {
+                ok: { type: "boolean" },
+                document_id: { type: "string", format: "uuid" }
+              } } } }
             }
           }
         }
       },
-
       "/update": {
         post: {
           operationId: "updateDoc",
@@ -452,38 +517,28 @@ app.get('/openapi.json', (_req, res) => {
               schema: {
                 type: "object",
                 properties: {
-                  project_id:   { type: "string", description: "UUID of project" },
-                  project_name: { type: "string", description: "Human-friendly name if you don't have the UUID" },
+                  project_id:   { type: "string", description: "Optional if default set" },
+                  project_name: { type: "string", description: "Optional if default set" },
                   document_id:  { type: "string", format: "uuid" },
                   title:        { type: "string" },
                   body_md:      { type: "string" },
                   tags:         { type: "array", items: { type: "string" } }
                 },
-                required: ["document_id"],
-                oneOf: [
-                  { required: ["project_id","document_id"] },
-                  { required: ["project_name","document_id"] }
-                ]
+                required: ["document_id"]
               }
-            }}
+            } }
           },
           responses: {
             "200": {
               description: "Updated",
-              content: { "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    ok: { type: "boolean" },
-                    document_id: { type: "string", format: "uuid" }
-                  }
-                }
-              }}
+              content: { "application/json": { schema: { type: "object", properties: {
+                ok: { type: "boolean" },
+                document_id: { type: "string", format: "uuid" }
+              } } } }
             }
           }
         }
       },
-
       "/update-by-title": {
         post: {
           operationId: "updateDocByTitle",
@@ -495,37 +550,27 @@ app.get('/openapi.json', (_req, res) => {
               schema: {
                 type: "object",
                 properties: {
-                  project_id:   { type: "string", description: "UUID of project" },
-                  project_name: { type: "string", description: "Human-friendly project name" },
+                  project_id:   { type: "string", description: "Optional if default set" },
+                  project_name: { type: "string", description: "Optional if default set" },
                   title:        { type: "string", description: "Document title to update" },
                   body_md:      { type: "string" },
                   tags:         { type: "array", items: { type: "string" } }
                 },
-                required: ["title"],
-                oneOf: [
-                  { required: ["project_id","title"] },
-                  { required: ["project_name","title"] }
-                ]
+                required: ["title"]
               }
-            }}
+            } }
           },
           responses: {
             "200": {
               description: "Updated",
-              content: { "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    ok: { type: "boolean" },
-                    document_id: { type: "string", format: "uuid" }
-                  }
-                }
-              }}
+              content: { "application/json": { schema: { type: "object", properties: {
+                ok: { type: "boolean" },
+                document_id: { type: "string", format: "uuid" }
+              } } } }
             }
           }
         }
       },
-
       "/doc": {
         get: {
           operationId: "getDoc",
@@ -536,20 +581,18 @@ app.get('/openapi.json', (_req, res) => {
           responses: { "200": { description: "Document" } }
         }
       },
-
       "/doc-by-title": {
         get: {
           operationId: "getDocByTitle",
-          summary: "Get latest doc by title (by project name or id)",
+          summary: "Get latest doc by title (by project name or id or default)",
           parameters: [
-            { in: "query", name: "project_id",   required: false, schema: { type: "string" } },
+            { in: "query", name: "project_id", required: false, schema: { type: "string" } },
             { in: "query", name: "project_name", required: false, schema: { type: "string" } },
-            { in: "query", name: "title",        required: true,  schema: { type: "string" } }
+            { in: "query", name: "title", required: true, schema: { type: "string" } }
           ],
           responses: { "200": { description: "Document" } }
         }
       },
-
       "/list-docs": {
         get: {
           operationId: "listDocs",
@@ -564,7 +607,6 @@ app.get('/openapi.json', (_req, res) => {
           responses: { "200": { description: "Document list" } }
         }
       },
-
       "/projects": {
         get: {
           operationId: "listProjects",
@@ -573,7 +615,6 @@ app.get('/openapi.json', (_req, res) => {
           responses: { "200": { description: "Projects" } }
         }
       },
-
       "/project": {
         post: {
           operationId: "createOrGetProject",
@@ -581,16 +622,14 @@ app.get('/openapi.json', (_req, res) => {
           security: [{ bearerAuth: [] }],
           requestBody: {
             required: true,
-            content: { "application/json": {
-              schema: {
-                type: "object",
-                required: ["name"],
-                properties: {
-                  name: { type: "string" },
-                  description: { type: "string" }
-                }
+            content: { "application/json": { schema: {
+              type: "object",
+              required: ["name"],
+              properties: {
+                name: { type: "string" },
+                description: { type: "string" }
               }
-            }}
+            } } }
           },
           responses: { "200": { description: "Project id" } }
         }
@@ -600,7 +639,7 @@ app.get('/openapi.json', (_req, res) => {
       securitySchemes: {
         bearerAuth: { type: "http", scheme: "bearer", bearerFormat: "JWT" }
       },
-      schemas: {}
+      schemas: {} // must be an object for GPT's validator
     }
   })
 })

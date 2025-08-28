@@ -6,14 +6,22 @@ import OpenAI from 'openai'
 
 const app = express()
 app.use(express.json({ limit: '2mb' }))
-
-// CORS: widen or lock down later
 app.use(cors({ origin: ['http://localhost:3000', '*'] }))
+
+// ====== 🔑 AUTH GUARD ======
+const API_TOKEN = process.env.API_TOKEN
+const requireAuth = (req, res, next) => {
+  if (!API_TOKEN) return next(); // allow all if not set (dev mode)
+  const ok = req.headers.authorization === `Bearer ${API_TOKEN}`
+  if (!ok) return res.status(401).json({ error: 'Unauthorized' })
+  next()
+}
+// ===========================
 
 // ENV
 const DB_URL = process.env.DB_URL
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY
-const MODEL_EMBED = process.env.MODEL_EMBED || 'text-embedding-3-small' // 1536-dim
+const MODEL_EMBED = process.env.MODEL_EMBED || 'text-embedding-3-small'
 const MODEL_CHAT  = process.env.MODEL_CHAT  || 'gpt-4o'
 
 if (!DB_URL || !OPENAI_API_KEY) {
@@ -111,7 +119,7 @@ app.post('/ask-stream', async (req, res) => {
 })
 
 // ---------- WRITE: save a new doc + embed ----------
-app.post('/ingest', async (req, res) => {
+app.post('/ingest', requireAuth, async (req, res) => {
   try {
     const { project_id, doc_type, title, body_md, tags = [] } = req.body || {}
     if (!project_id || !doc_type || !title || !body_md) {
@@ -154,7 +162,7 @@ app.post('/ingest', async (req, res) => {
 })
 
 // ---------- WRITE: update an existing doc (and re-embed if body changed) ----------
-app.post('/update', async (req, res) => {
+app.post('/update', requireAuth, async (req, res) => {
   try {
     const { document_id, project_id, title, body_md, tags } = req.body || {}
     if (!document_id || !project_id || (!title && !body_md && !tags)) {
@@ -205,5 +213,83 @@ app.post('/update', async (req, res) => {
   }
 })
 
+// Update a doc by title (avoids needing the UUID)
+app.post('/update-by-title', requireAuth, async (req, res) => {
+  try {
+    const { project_id, title, body_md, tags } = req.body || {};
+    if (!project_id || !title || (!body_md && !tags)) {
+      return res.status(400).json({ error: 'project_id, title and at least one of body_md/tags required' });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT id FROM documents WHERE project_id = $1 AND title = $2 ORDER BY updated_at DESC LIMIT 1`,
+      [project_id, title]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Document not found' });
+
+    const document_id = rows[0].id;
+
+    // Reuse your /update logic by calling the DB directly here:
+    const sets = [];
+    const vals = [];
+    let idx = 1;
+    if (body_md) { sets.push(`body_md = $${idx++}`); vals.push(body_md); }
+    if (tags)    { sets.push(`tags = $${idx++}`);    vals.push(tags); }
+    sets.push(`updated_at = now()`);
+    vals.push(project_id, document_id);
+
+    await pool.query(
+      `UPDATE documents SET ${sets.join(', ')} WHERE project_id = $${idx++} AND id = $${idx}`,
+      vals
+    );
+
+    if (body_md) {
+      await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id]);
+
+      const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+      const chunks = paragraphs.length ? paragraphs : [body_md];
+
+      for (let i = 0; i < chunks.length; i += 16) {
+        const batch = chunks.slice(i, i + 16);
+        const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch });
+        for (let j = 0; j < batch.length; j++) {
+          const vec = resp.data[j].embedding;
+          const vecStr = `[${vec.map(v => v.toFixed(8)).join(',')}]`;
+          await pool.query(
+            `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
+             VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
+            [project_id, document_id, i + j + 1, batch[j], vecStr, JSON.stringify({ title, doc_type: 'update' })]
+          );
+        }
+      }
+    }
+
+    res.json({ ok: true, document_id });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// List recent docs for a project (optional helper)
+app.get('/list-docs', async (req, res) => {
+  try {
+    const project_id = req.query.project_id;
+    const limit = Math.min(parseInt(req.query.limit || '25', 10), 100);
+    if (!project_id) return res.status(400).json({ error: 'project_id required' });
+
+    const { rows } = await pool.query(
+      `SELECT id, title, doc_type, tags, created_at, updated_at
+       FROM documents
+       WHERE project_id = $1
+       ORDER BY updated_at DESC
+       LIMIT $2`,
+      [project_id, limit]
+    );
+    res.json({ items: rows });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
 const PORT = process.env.PORT || 8787
 app.listen(PORT, () => console.log(`API running on :${PORT}`))

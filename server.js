@@ -92,32 +92,28 @@ app.post('/clear-default-project', requireAuth, (_req, res) => {
 })
 
 async function resolveProjectId(project_id, project_name) {
-  // explicit id
   if (project_id) return project_id;
-
-  // explicit name
   if (project_name) {
-    const { rows } = await pool.query(`SELECT id FROM projects WHERE name = $1`, [project_name]);
+    // case/trim/space-insensitive
+    const { rows } = await pool.query(
+      `SELECT id FROM projects
+       WHERE trim(lower(name)) = trim(lower($1))`,
+      [project_name]
+    );
     if (!rows.length) throw new Error(`Project not found: ${project_name}`);
     return rows[0].id;
   }
-
-  // in-memory defaults (set via /set-default-project)
+  // fall back to in-memory / env defaults (your existing logic)
   if (defaultProjectId) return defaultProjectId;
   if (defaultProjectName) {
-    const { rows } = await pool.query(`SELECT id FROM projects WHERE name = $1`, [defaultProjectName]);
+    const { rows } = await pool.query(
+      `SELECT id FROM projects
+       WHERE trim(lower(name)) = trim(lower($1))`,
+      [defaultProjectName]
+    );
     if (!rows.length) throw new Error(`Default project not found: ${defaultProjectName}`);
     return rows[0].id;
   }
-
-  // ENV fallbacks (persist across restarts)
-  if (DEFAULT_PROJECT_ID) return DEFAULT_PROJECT_ID;
-  if (DEFAULT_PROJECT_NAME) {
-    const { rows } = await pool.query(`SELECT id FROM projects WHERE name = $1`, [DEFAULT_PROJECT_NAME]);
-    if (!rows.length) throw new Error(`Default project not found (env): ${DEFAULT_PROJECT_NAME}`);
-    return rows[0].id;
-  }
-
   throw new Error('Need project_id or project_name (no default set)');
 }
 

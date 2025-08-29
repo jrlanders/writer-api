@@ -42,54 +42,12 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY })
 // Build tag / health
 const APP_BUILD = '2025-08-28-session-defaults-1.4.4'
 
-// ---------- Session default project (Option C) ----------
-// In-memory session default (set via /set-default-project).
-// These are cleared on process restart; resolver also falls back to env defaults above.
+// ---------- Session default project ----------
 let defaultProjectId = null
 let defaultProjectName = null
 
 function coerceMeta(m) {
   return (m && typeof m === 'object' && !Array.isArray(m)) ? m : {};
-}
-
-// --- Minimal scene store (in-memory) ---
-const SCENE_STORE = new Map(); // key -> string
-const sceneKey = (project, chapterId, sceneId) => `${project}::${chapterId}::${sceneId}`
-
-/**
- * saveScene({ project, chapterId, sceneId, content, mode, chunkIndex, chunkCount })
- * mode: "overwrite" for first chunk, "append" for the rest
- */
-async function saveScene({ project, chapterId, sceneId, content, mode = "overwrite", chunkIndex = 0, chunkCount = 1 }) {
-  // If appending, fetch existing content first
-  if (mode === 'append') {
-    const { rows } = await pool.query(
-      `SELECT content FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
-      [project, chapterId, sceneId]
-    );
-    const prev = rows[0]?.content || "";
-    content = prev ? `${prev}\n\n${content}` : content;
-  }
-
-  await pool.query(
-    `INSERT INTO scenes (project, chapter_id, scene_id, content, updated_at)
-     VALUES ($1,$2,$3,$4, now())
-     ON CONFLICT (project, chapter_id, scene_id)
-     DO UPDATE SET content = EXCLUDED.content, updated_at = now()`,
-    [project, chapterId, sceneId, content]
-  );
-
-  const { rows: R } = await pool.query(
-    `SELECT length(content) AS len FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
-    [project, chapterId, sceneId]
-  );
-
-  return {
-    ok: true,
-    project, chapterId, sceneId,
-    mode, chunkIndex, chunkCount,
-    length: Number(R[0].len)
-  };
 }
 
 // ---------- HELPERS ----------
@@ -418,9 +376,53 @@ app.post('/ingest', requireAuth, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
-});
+})
 
-// ---------- SCENES: paste (auto-split + save) ----------
+// ---------- SCENES: Postgres-backed persistence ----------
+
+// Save/append one chunk directly
+app.post('/scenes/upsert', requireAuth, async (req, res) => {
+  try {
+    const { project, chapterId, sceneId, content, mode = 'overwrite' } = req.body || {};
+    if (!project || !chapterId || !sceneId) {
+      return res.status(400).json({ error: 'project, chapterId, sceneId required' })
+    }
+    if (typeof content !== 'string' || !content.trim()) {
+      return res.status(400).json({ error: 'content must be a non-empty string' })
+    }
+
+    // append: fetch prior
+    let finalContent = content
+    if (mode === 'append') {
+      const { rows } = await pool.query(
+        `SELECT content FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
+        [project, chapterId, sceneId]
+      );
+      const prev = rows[0]?.content || ""
+      finalContent = prev ? `${prev}\n\n${content}` : content
+    }
+
+    await pool.query(
+      `INSERT INTO scenes (project, chapter_id, scene_id, content, updated_at)
+       VALUES ($1,$2,$3,$4, now())
+       ON CONFLICT (project, chapter_id, scene_id)
+       DO UPDATE SET content = EXCLUDED.content, updated_at = now()`,
+      [project, chapterId, sceneId, finalContent]
+    )
+
+    const { rows: R } = await pool.query(
+      `SELECT length(content) AS len FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
+      [project, chapterId, sceneId]
+    )
+
+    res.json({ ok: true, project, chapterId, sceneId, mode, length: Number(R[0].len) })
+  } catch (err) {
+    console.error('upsert scene error', err)
+    res.status(500).json({ error: 'internal_error', detail: String(err?.message || err) })
+  }
+})
+
+// Paste a full scene; server splits & upserts sequentially
 app.post('/scenes/paste', async (req, res) => {
   try {
     const { project, chapterId, sceneId, content, maxChunk = 12000 } = req.body || {};
@@ -440,15 +442,32 @@ app.post('/scenes/paste', async (req, res) => {
     const results = [];
     for (let i = 0; i < chunks.length; i++) {
       const mode = i === 0 ? 'overwrite' : 'append';
-      const out = await saveScene({
-        project, chapterId, sceneId,
-        content: chunks[i],
-        mode,
-        chunkIndex: i,
-        chunkCount: chunks.length
-      });
-      if (out?.error) return res.status(500).json({ error: out.error, failedAt: i });
-      results.push(out);
+
+      // overwrite/append into Postgres
+      let finalContent = chunks[i]
+      if (mode === 'append') {
+        const { rows } = await pool.query(
+          `SELECT content FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
+          [project, chapterId, sceneId]
+        );
+        const prev = rows[0]?.content || ""
+        finalContent = prev ? `${prev}\n\n${chunks[i]}` : chunks[i]
+      }
+
+      await pool.query(
+        `INSERT INTO scenes (project, chapter_id, scene_id, content, updated_at)
+         VALUES ($1,$2,$3,$4, now())
+         ON CONFLICT (project, chapter_id, scene_id)
+         DO UPDATE SET content = EXCLUDED.content, updated_at = now()`,
+        [project, chapterId, sceneId, finalContent]
+      )
+
+      const { rows: R } = await pool.query(
+        `SELECT length(content) AS len FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
+        [project, chapterId, sceneId]
+      )
+
+      results.push({ ok: true, project, chapterId, sceneId, mode, chunkIndex: i, chunkCount: chunks.length, length: Number(R[0].len) })
     }
 
     return res.json({ ok: true, project, chapterId, sceneId, chunks: chunks.length, maxChunk, results });
@@ -458,7 +477,7 @@ app.post('/scenes/paste', async (req, res) => {
   }
 })
 
-// ---------- SCENES: get (verify stored scene) ----------
+// Read back a stored scene
 app.get('/scenes/get', async (req, res) => {
   try {
     const { project, chapterId, sceneId } = req.query || {};
@@ -487,7 +506,148 @@ app.get('/scenes/get', async (req, res) => {
   }
 });
 
-// ---------- WRITE: update an existing doc (and re-embed if body changed) ----------
+// List scenes for a project (optional chapter filter)
+app.get('/scenes/list', async (req, res) => {
+  try {
+    const { project, chapterId, limit = 100 } = req.query || {}
+    if (!project) return res.status(400).json({ error: 'project required' })
+    const lim = Math.min(parseInt(limit, 10) || 100, 500)
+
+    const clauses = ['project = $1']
+    const vals = [project]
+    let idx = 2
+    if (chapterId) { clauses.push(`chapter_id = $${idx++}`); vals.push(chapterId) }
+
+    const { rows } = await pool.query(
+      `SELECT project, chapter_id, scene_id, left(content, 120) AS snippet, updated_at, length(content) AS length
+         FROM scenes
+        WHERE ${clauses.join(' AND ')}
+        ORDER BY updated_at DESC
+        LIMIT $${idx}`,
+      [...vals, lim]
+    )
+
+    res.json({ items: rows })
+  } catch (err) {
+    console.error('list scenes error', err)
+    res.status(500).json({ error: 'internal_error', detail: String(err?.message || err) })
+  }
+})
+
+// Delete a scene (protected)
+app.delete('/scenes/delete', requireAuth, async (req, res) => {
+  try {
+    const { project, chapterId, sceneId } = req.query || {}
+    if (!project || !chapterId || !sceneId) {
+      return res.status(400).json({ error: 'project, chapterId, sceneId required' })
+    }
+    const { rowCount } = await pool.query(
+      `DELETE FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
+      [project, chapterId, sceneId]
+    )
+    if (rowCount === 0) return res.status(404).json({ error: 'not_found' })
+    res.json({ ok: true, project, chapterId, sceneId })
+  } catch (err) {
+    console.error('delete scene error', err)
+    res.status(500).json({ error: 'internal_error', detail: String(err?.message || err) })
+  }
+})
+
+// Paste + immediate Lyra critique
+app.post('/scenes/paste-and-critique', async (req, res) => {
+  try {
+    const { project, chapterId, sceneId, content, maxChunk = 12000, mode = 'both' } = req.body || {}
+    if (!project || !chapterId || !sceneId) {
+      return res.status(400).json({ error: 'project, chapterId, and sceneId are required' })
+    }
+    if (typeof content !== 'string' || !content.trim()) {
+      return res.status(400).json({ error: 'content must be a non-empty string' })
+    }
+    if (content.length > 1_000_000) {
+      return res.status(413).json({ error: 'content too large (>1MB). Consider splitting logically.' })
+    }
+
+    // First: persist (use same logic as /scenes/paste, but no chunking unless needed)
+    const chunks = chunkText(content, Number(maxChunk) || 12000)
+    for (let i = 0; i < chunks.length; i++) {
+      const writeMode = i === 0 ? 'overwrite' : 'append'
+      let finalContent = chunks[i]
+      if (writeMode === 'append') {
+        const { rows } = await pool.query(
+          `SELECT content FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
+          [project, chapterId, sceneId]
+        );
+        const prev = rows[0]?.content || ""
+        finalContent = prev ? `${prev}\n\n${chunks[i]}` : chunks[i]
+      }
+      await pool.query(
+        `INSERT INTO scenes (project, chapter_id, scene_id, content, updated_at)
+         VALUES ($1,$2,$3,$4, now())
+         ON CONFLICT (project, chapter_id, scene_id)
+         DO UPDATE SET content = EXCLUDED.content, updated_at = now()`,
+        [project, chapterId, sceneId, finalContent]
+      )
+    }
+
+    // Then: Lyra critique of the FULL content just submitted
+    const isMuseOnly = /muse-only|^\[muse only\]/i.test(mode)
+    const isEditorOnly = /editor-only|^\[editor only\]/i.test(mode)
+    let lyraPrompt = `
+You are **Lyra**, James’s creative muse **and** critical editor for the project "${project}".
+
+Every response must include two labeled parts:
+
+1) **Creative Insight** — imaginative expansion (themes, symbolism, worldbuilding, character beats, dialogue options, sensory detail, metaphor, title lines). Offer 2–4 concrete upgrades.
+
+2) **Critical Feedback** — honest, concise, actionable critique that raises the work toward bestseller quality. Focus on clarity of motivation, stakes, pacing, tension curve, POV control, redundancy, cliché risk, and market fit. Provide fixes, not just flags.
+
+Guardrails:
+- Never sugarcoat. If something’s weak, say why and show a better version.
+- Prefer specificity over generalities; cite exact lines/beat locations when possible.
+- Maintain James’s voice; suggest edits that preserve tone and intent.
+- If asked for outline/structure, ensure beats align with his Writing-from-the-Middle template.
+
+Answer format (always):
+**Creative Insight:** …
+**Critical Feedback:** …
+    `.trim()
+
+    if (isMuseOnly) {
+      lyraPrompt = lyraPrompt.replace(
+        "Answer format (always):",
+        "Answer format (Muse Only):\n**Creative Insight:** …"
+      )
+    }
+    if (isEditorOnly) {
+      lyraPrompt = lyraPrompt.replace(
+        "Answer format (always):",
+        "Answer format (Editor Only):\n**Critical Feedback:** …"
+      )
+    }
+
+    const messages = [
+      { role: 'system', content: lyraPrompt },
+      { role: 'user', content: `Context:\n${content}\n\nQuestion: Review this scene.` }
+    ]
+
+    const gpt = await openai.chat.completions.create({
+      model: MODEL_CHAT,
+      messages,
+      temperature: 0.7
+    })
+
+    res.json({
+      ok: true,
+      saved: { project, chapterId, sceneId, chunks: chunks.length },
+      critique: gpt.choices?.[0]?.message?.content || ''
+    })
+  } catch (err) {
+    console.error('paste-and-critique error', err)
+    res.status(500).json({ error: 'internal_error', detail: String(err?.message || err) })
+  }
+})
+
+// ---------- UPDATE / RE-EMBED ----------
 app.post('/update', requireAuth, async (req, res) => {
   try {
     const { document_id, project_id, project_name, title, body_md, tags, meta } = req.body || {};
@@ -548,9 +708,9 @@ app.post('/update', requireAuth, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
-});
+})
 
-// ---------- WRITE: update by title (avoids needing the UUID) ----------
+// ---------- UPDATE BY TITLE ----------
 app.post('/update-by-title', requireAuth, async (req, res) => {
   try {
     const { project_id, project_name, title, body_md, tags, meta } = req.body || {};
@@ -617,9 +777,9 @@ app.post('/update-by-title', requireAuth, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
-});
+})
 
-// ---------- LIST DOCS (filters) ----------
+// ---------- LIST DOCS ----------
 app.get('/list-docs', async (req, res) => {
   try {
     const { project_id, project_name, doc_type, q } = req.query
@@ -647,7 +807,7 @@ app.get('/list-docs', async (req, res) => {
   }
 })
 
-// ---------- READ: get one doc by UUID ----------
+// ---------- DOC READERS ----------
 app.get('/doc', async (req, res) => {
   try {
     const { id } = req.query
@@ -667,7 +827,6 @@ app.get('/doc', async (req, res) => {
   }
 })
 
-// ---------- READ: get latest doc by title (by project name or id) ----------
 app.get('/doc-by-title', async (req, res) => {
   try {
     const { project_id, project_name, title } = req.query
@@ -696,7 +855,7 @@ app.get('/openapi.json', (_req, res) => {
   "openapi": "3.1.0",
   "info": {
     "title": "Writer Brain API",
-    "version": "1.4.5"
+    "version": "1.4.6"
   },
   "servers": [
     { "url": "https://writer-api-p0c7.onrender.com" }

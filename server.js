@@ -120,6 +120,18 @@ async function retrieveTopK(projectId, query, k = 8) {
   return rows
 }
 
+// Health checks
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    build: APP_BUILD,
+    defaults: {
+      inMemory: { id: defaultProjectId, name: defaultProjectName },
+      env: { id: DEFAULT_PROJECT_ID, name: DEFAULT_PROJECT_NAME }
+    }
+  });
+});
+
 // ---------- PROJECTS ----------
 app.post('/project', requireAuth, async (req, res) => {
   try {

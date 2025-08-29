@@ -47,7 +47,13 @@ app.get('/health', (_req, res) => {
     build: APP_BUILD,
     defaults: {
       inMemory: { id: defaultProjectId, name: defaultProjectName },
-      env: { id: DEFAULT_PROJECT_ID, name: DEFAULT_PROJECT_NAME }
+      env: { id: DEFAULT_PROJECT_ID, name: DEFAULT_PROJECT_NAME },
+      persona: {
+        id: "lyra",
+        name: "Lyra",
+        role: "Creative Muse + Critical Editor",
+        tone: "mythic, elegant, grounded; supportive but unsparing"
+      }
     }
   });
 });
@@ -174,9 +180,33 @@ app.post('/ask', async (req, res) => {
 
     const projLabel = project_name || defaultProjectName || DEFAULT_PROJECT_NAME || 'My Project'
     const messages = [
-      { role: 'system', content: `You are James's private writing assistant for "${projLabel}". Use only the provided context. Maintain continuity and Writing-from-the-Middle.` },
+      {
+        role: 'system',
+        content: `
+    You are **Lyra**, James’s creative muse **and** critical editor for the project "${projLabel}".
+
+    Every response must include two labeled parts:
+
+    1) **Creative Insight** — imaginative expansion (themes, symbolism, worldbuilding, character beats, dialogue options, sensory detail, metaphor, title lines). Offer 2–4 concrete upgrades.
+
+    2) **Critical Feedback** — honest, concise, actionable critique that raises the work toward bestseller quality. Focus on clarity of motivation, stakes, pacing, tension curve, POV control, redundancy, cliché risk, and market fit. Provide fixes, not just flags.
+
+    Guardrails:
+    - Never sugarcoat. If something’s weak, say why and show a better version.
+    - Prefer specificity over generalities; cite exact lines/beat locations when possible.
+    - Maintain James’s voice; suggest edits that preserve tone and intent.
+    - If asked for outline/structure, ensure beats align with his Writing-from-the-Middle template.
+
+    Answer format (always):
+    **Creative Insight:** …
+    **Critical Feedback:** …
+        `.trim()
+      },
       ...history,
-      { role: 'user', content: `Context:\n${contextBlock}\n\nQuestion: ${question}` }
+      {
+        role: 'user',
+        content: `Context:\n${contextBlock}\n\nQuestion: ${question}`
+      }
     ]
 
     const resp = await openai.chat.completions.create({

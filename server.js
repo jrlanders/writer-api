@@ -38,7 +38,7 @@ const pool = new Pool({ connectionString: DB_URL, ssl: { rejectUnauthorized: fal
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY })
 
 // Build tag / health
-const APP_BUILD = '2025-08-28-session-defaults-1.4.3'
+const APP_BUILD = '2025-08-28-session-defaults-1.4.4'
 app.get('/health', (_req, res) => res.json({ ok: true, build: APP_BUILD }))
 
 // ---------- Session default project (Option C) ----------
@@ -442,7 +442,7 @@ app.get('/doc-by-title', async (req, res) => {
 app.get('/openapi.json', (_req, res) => {
   res.json({
     openapi: "3.1.0",
-    info: { title: "Writer Brain API", version: "1.4.3" },
+    info: { title: "Writer Brain API", version: "1.4.4" },
     servers: [{ url: "https://writer-api-p0c7.onrender.com" }],
     paths: {
       "/ask": {

@@ -60,17 +60,36 @@ const sceneKey = (project, chapterId, sceneId) => `${project}::${chapterId}::${s
  * saveScene({ project, chapterId, sceneId, content, mode, chunkIndex, chunkCount })
  * mode: "overwrite" for first chunk, "append" for the rest
  */
-function saveScene({ project, chapterId, sceneId, content, mode = "overwrite", chunkIndex = 0, chunkCount = 1 }) {
-  const key = sceneKey(project, chapterId, sceneId)
-  if (mode === "overwrite") {
-    SCENE_STORE.set(key, content)
-  } else {
-    const prev = SCENE_STORE.get(key) || ""
-    // join with two newlines so paragraphs don't stick together
-    SCENE_STORE.set(key, prev ? `${prev}\n\n${content}` : content)
+async function saveScene({ project, chapterId, sceneId, content, mode = "overwrite", chunkIndex = 0, chunkCount = 1 }) {
+  // If appending, fetch existing content first
+  if (mode === 'append') {
+    const { rows } = await pool.query(
+      `SELECT content FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
+      [project, chapterId, sceneId]
+    );
+    const prev = rows[0]?.content || "";
+    content = prev ? `${prev}\n\n${content}` : content;
   }
-  const stored = SCENE_STORE.get(key) || ""
-  return { ok: true, project, chapterId, sceneId, mode, chunkIndex, chunkCount, length: stored.length }
+
+  await pool.query(
+    `INSERT INTO scenes (project, chapter_id, scene_id, content, updated_at)
+     VALUES ($1,$2,$3,$4, now())
+     ON CONFLICT (project, chapter_id, scene_id)
+     DO UPDATE SET content = EXCLUDED.content, updated_at = now()`,
+    [project, chapterId, sceneId, content]
+  );
+
+  const { rows: R } = await pool.query(
+    `SELECT length(content) AS len FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
+    [project, chapterId, sceneId]
+  );
+
+  return {
+    ok: true,
+    project, chapterId, sceneId,
+    mode, chunkIndex, chunkCount,
+    length: Number(R[0].len)
+  };
 }
 
 // ---------- HELPERS ----------
@@ -440,16 +459,33 @@ app.post('/scenes/paste', async (req, res) => {
 })
 
 // ---------- SCENES: get (verify stored scene) ----------
-app.get('/scenes/get', (req, res) => {
-  const { project, chapterId, sceneId } = req.query || {};
-  if (!project || !chapterId || !sceneId) {
-    return res.status(400).json({ error: 'project, chapterId, sceneId required' });
+app.get('/scenes/get', async (req, res) => {
+  try {
+    const { project, chapterId, sceneId } = req.query || {};
+    if (!project || !chapterId || !sceneId) {
+      return res.status(400).json({ error: 'project, chapterId, sceneId required' });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT content, updated_at FROM scenes
+       WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
+      [project, chapterId, sceneId]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: 'not_found' });
+
+    res.json({
+      ok: true,
+      project, chapterId, sceneId,
+      length: rows[0].content.length,
+      updated_at: rows[0].updated_at,
+      content: rows[0].content
+    });
+  } catch (err) {
+    console.error('get scene error', err);
+    res.status(500).json({ error: 'internal_error', detail: String(err?.message || err) });
   }
-  const key = sceneKey(project, chapterId, sceneId);
-  const content = SCENE_STORE.get(key);
-  if (content == null) return res.status(404).json({ error: 'not_found' });
-  res.json({ ok: true, project, chapterId, sceneId, length: content.length, content });
-})
+});
 
 // ---------- WRITE: update an existing doc (and re-embed if body changed) ----------
 app.post('/update', requireAuth, async (req, res) => {

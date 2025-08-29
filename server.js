@@ -363,23 +363,16 @@ app.post('/scenes/paste', async (req, res) => {
     // Replace this with your actual persistence logic:
     // Example assumes you already have an internal handler we can call.
     async function upsertScene(mode, part, idx) {
-      // If you have a DB layer, call it here.
-      // If your server expects HTTP to /scenes/upsert, uncomment below:
-
-      // return fetch(`${baseUrl}/scenes/upsert`, {
-      //   method: 'POST',
-      //   headers: { 'Content-Type': 'application/json' },
-      //   body: JSON.stringify({
-      //     project, chapterId, sceneId,
-      //     content: part,
-      //     chunkIndex: idx,
-      //     chunkCount: chunks.length,
-      //     mode // "overwrite" then "append"
-      //   })
-      // }).then(r => r.json());
-
-      // Placeholder: simulate success
-      return { ok: true, mode, idx };
+  // Example signature—adjust to your actual function:
+      return await saveScene({
+        project,
+        chapterId,
+        sceneId,
+        content: part,
+        mode,          // "overwrite" | "append"
+        chunkIndex: idx,
+        chunkCount: chunks.length
+      });
     }
 
     const results = [];

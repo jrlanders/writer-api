@@ -441,33 +441,33 @@ app.get('/doc-by-title', async (req, res) => {
 app.get('/openapi.json', (_req, res) => {
   res.json({
     openapi: "3.1.0",
-    info: { title: "Writer Brain API", version: "1.4.4" },
+    info: { title: "Writer Brain API", version: "1.4.5" },
     servers: [{ url: "https://writer-api-p0c7.onrender.com" }],
     paths: {
       "/ask": {
         post: {
           operationId: "askProject",
-          summary: "Retrieve an answer using RAG",
+          summary: "Answer a question using RAG against the current project (uses default if none provided).",
           requestBody: {
             required: true,
             content: {
               "application/json": {
-                schema: {
-                  type: "object",
-                  required: ["question"],
-                  properties: {
-                    question: { type: "string" },
-                    project_id: { type: "string" },
-                    project_name: { type: "string" },
-                    history: {
-                      type: "array",
-                      items: {
-                        type: "object",
-                        properties: {
-                          role: { type: "string", enum: ["system","user","assistant"] },
-                          content: { type: "string" }
+                "schema": {
+                  "type": "object",
+                  "required": ["question"],
+                  "properties": {
+                    "question": { "type": "string" },
+                    "project_id": { "type": "string", "description": "Optional. If omitted, server default is used." },
+                    "project_name": { "type": "string", "description": "Optional. If omitted, server default is used." },
+                    "history": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "role": { "type": "string", "enum": ["system","user","assistant"] },
+                          "content": { "type": "string" }
                         },
-                        required: ["role","content"]
+                        "required": ["role","content"]
                       }
                     }
                   }
@@ -475,89 +475,44 @@ app.get('/openapi.json', (_req, res) => {
               }
             }
           },
-          responses: { "200": { description: "Answer JSON" } }
+          responses: { "200": { "description": "Answer JSON" } }
         }
       },
+
       "/ingest": {
         post: {
           operationId: "ingestDoc",
-          summary: "Create a new document and embed it",
+          summary: "Create a new document and embed it (uses default project if none provided).",
           security: [{ bearerAuth: [] }],
           requestBody: {
             required: true,
             content: {
               "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    project_id:   { type: "string", description: "UUID of project" },
-                    project_name: { type: "string", description: "Human-friendly name if you don't have the UUID" },
-                    doc_type:     { type: "string", example: "artifact", description: "character | chapter | scene | concept | artifact | location | ..." },
-                    title:        { type: "string" },
-                    body_md:      { type: "string" },
-                    tags:         { type: "array", items: { type: "string" } }
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id":   { "type": "string", "description": "Optional project UUID. Defaults to server/session project if omitted." },
+                    "project_name": { "type": "string", "description": "Optional project name. Defaults to server/session project if omitted." },
+                    "doc_type":     { "type": "string", "example": "concept", "description": "character | chapter | scene | concept | artifact | location | ..." },
+                    "title":        { "type": "string" },
+                    "body_md":      { "type": "string" },
+                    "tags":         { "type": "array", "items": { "type": "string" } }
                   },
-                  required: ["doc_type","title","body_md"],
-                  oneOf: [
-                    { required: ["project_id"] },
-                    { required: ["project_name"] }
-                  ]
+                  "required": ["doc_type","title","body_md"]
                 }
               }
             }
           },
           responses: {
             "200": {
-              description: "Ingested",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      ok: { type: "boolean" },
-                      document_id: { type: "string", format: "uuid" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      },
-      "/set-default-project": {
-        "post": {
-          "operationId": "setDefaultProject",
-          "summary": "Set the default project for this session (name or id)",
-          "security": [{ "bearerAuth": [] }],
-          "requestBody": {
-            "required": true,
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "project_id":   { "type": "string", "description": "UUID of project" },
-                    "project_name": { "type": "string", "description": "Human-friendly project name" }
-                  },
-                  "oneOf": [
-                    { "required": ["project_id"] },
-                    { "required": ["project_name"] }
-                  ]
-                }
-              }
-            }
-          },
-          "responses": {
-            "200": {
-              "description": "Default set",
+              "description": "Ingested",
               "content": {
                 "application/json": {
                   "schema": {
                     "type": "object",
                     "properties": {
                       "ok": { "type": "boolean" },
-                      "defaultProjectId": { "type": "string" },
-                      "defaultProjectName": { "type": "string" }
+                      "document_id": { "type": "string", "format": "uuid" }
                     }
                   }
                 }
@@ -566,44 +521,41 @@ app.get('/openapi.json', (_req, res) => {
           }
         }
       },
+
       "/update": {
         post: {
           operationId: "updateDoc",
-          summary: "Update an existing document by UUID and re-embed",
+          summary: "Update an existing document by UUID and re-embed (uses default project if none provided).",
           security: [{ bearerAuth: [] }],
           requestBody: {
             required: true,
             content: {
               "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    project_id:   { type: "string", description: "UUID of project" },
-                    project_name: { type: "string", description: "Human-friendly name if you don't have the UUID" },
-                    document_id:  { type: "string", format: "uuid" },
-                    title:        { type: "string" },
-                    body_md:      { type: "string" },
-                    tags:         { type: "array", items: { type: "string" } }
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id":   { "type": "string", "description": "Optional project UUID. Defaults to server/session project if omitted." },
+                    "project_name": { "type": "string", "description": "Optional project name. Defaults to server/session project if omitted." },
+                    "document_id":  { "type": "string", "format": "uuid" },
+                    "title":        { "type": "string" },
+                    "body_md":      { "type": "string" },
+                    "tags":         { "type": "array", "items": { "type": "string" } }
                   },
-                  required: ["document_id"],
-                  oneOf: [
-                    { required: ["project_id","document_id"] },
-                    { required: ["project_name","document_id"] }
-                  ]
+                  "required": ["document_id"]
                 }
               }
             }
           },
           responses: {
             "200": {
-              description: "Updated",
-              content: {
+              "description": "Updated",
+              "content": {
                 "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      ok: { type: "boolean" },
-                      document_id: { type: "string", format: "uuid" }
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "ok": { "type": "boolean" },
+                      "document_id": { "type": "string", "format": "uuid" }
                     }
                   }
                 }
@@ -612,43 +564,40 @@ app.get('/openapi.json', (_req, res) => {
           }
         }
       },
+
       "/update-by-title": {
         post: {
           operationId: "updateDocByTitle",
-          summary: "Update a document by title (no UUID) and re-embed",
+          summary: "Update a document by title (no UUID) and re-embed (uses default project if none provided).",
           security: [{ bearerAuth: [] }],
           requestBody: {
             required: true,
             content: {
               "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    project_id:   { type: "string", description: "UUID of project" },
-                    project_name: { type: "string", description: "Human-friendly project name" },
-                    title:        { type: "string", description: "Document title to update" },
-                    body_md:      { type: "string" },
-                    tags:         { type: "array", items: { type: "string" } }
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id":   { "type": "string", "description": "Optional project UUID. Defaults to server/session project if omitted." },
+                    "project_name": { "type": "string", "description": "Optional project name. Defaults to server/session project if omitted." },
+                    "title":        { "type": "string", "description": "Document title to update" },
+                    "body_md":      { "type": "string" },
+                    "tags":         { "type": "array", "items": { "type": "string" } }
                   },
-                  required: ["title"],
-                  oneOf: [
-                    { required: ["project_id","title"] },
-                    { required: ["project_name","title"] }
-                  ]
+                  "required": ["title"]
                 }
               }
             }
           },
           responses: {
             "200": {
-              description: "Updated",
-              content: {
+              "description": "Updated",
+              "content": {
                 "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      ok: { type: "boolean" },
-                      document_id: { type: "string", format: "uuid" }
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "ok": { "type": "boolean" },
+                      "document_id": { "type": "string", "format": "uuid" }
                     }
                   }
                 }
@@ -657,50 +606,55 @@ app.get('/openapi.json', (_req, res) => {
           }
         }
       },
+
       "/doc": {
         get: {
           operationId: "getDoc",
-          summary: "Get a single document by UUID (returns full body_md)",
+          summary: "Get a single document by UUID (returns full body_md).",
           parameters: [
-            { in: "query", name: "id", required: true, schema: { type: "string", format: "uuid" } }
+            { "in": "query", "name": "id", "required": true, "schema": { "type": "string", "format": "uuid" } }
           ],
-          responses: { "200": { description: "Document" } }
+          responses: { "200": { "description": "Document" } }
         }
       },
+
       "/doc-by-title": {
         get: {
           operationId: "getDocByTitle",
-          summary: "Get latest doc by title (by project name or id)",
+          summary: "Get latest doc by title (uses default project if none provided).",
           parameters: [
-            { in: "query", name: "project_id", required: false, schema: { type: "string" } },
-            { in: "query", name: "project_name", required: false, schema: { type: "string" } },
-            { in: "query", name: "title", required: true, schema: { type: "string" } }
+            { "in": "query", "name": "project_id",   "required": false, "schema": { "type": "string" } },
+            { "in": "query", "name": "project_name", "required": false, "schema": { "type": "string" } },
+            { "in": "query", "name": "title",        "required": true,  "schema": { "type": "string" } }
           ],
-          responses: { "200": { description: "Document" } }
+          responses: { "200": { "description": "Document" } }
         }
       },
+
       "/list-docs": {
         get: {
           operationId: "listDocs",
-          summary: "List recent docs in a project",
+          summary: "List recent docs in a project (uses default project if none provided).",
           parameters: [
-            { in: "query", name: "project_id",   required: false, schema: { type: "string" } },
-            { in: "query", name: "project_name", required: false, schema: { type: "string" } },
-            { in: "query", name: "doc_type",     required: false, schema: { type: "string" }, description: "Filter by doc_type (e.g., character, note, chapter)" },
-            { in: "query", name: "q",            required: false, schema: { type: "string" }, description: "Search in title or tags (ILIKE)" },
-            { in: "query", name: "limit",        required: false, schema: { type: "integer", default: 25, minimum: 1, maximum: 100 } }
+            { "in": "query", "name": "project_id",   "required": false, "schema": { "type": "string" } },
+            { "in": "query", "name": "project_name", "required": false, "schema": { "type": "string" } },
+            { "in": "query", "name": "doc_type",     "required": false, "schema": { "type": "string" }, "description": "Filter by doc_type" },
+            { "in": "query", "name": "q",            "required": false, "schema": { "type": "string" }, "description": "Search in title or tags (ILIKE)" },
+            { "in": "query", "name": "limit",        "required": false, "schema": { "type": "integer", "default": 25, "minimum": 1, "maximum": 100 } }
           ],
-          responses: { "200": { description: "Document list" } }
+          responses: { "200": { "description": "Document list" } }
         }
       },
+
       "/projects": {
         get: {
           operationId: "listProjects",
           summary: "List all projects",
           security: [{ bearerAuth: [] }],
-          responses: { "200": { description: "Projects" } }
+          responses: { "200": { "description": "Projects" } }
         }
       },
+
       "/project": {
         post: {
           operationId: "createOrGetProject",
@@ -710,18 +664,41 @@ app.get('/openapi.json', (_req, res) => {
             required: true,
             content: {
               "application/json": {
-                schema: {
-                  type: "object",
-                  required: ["name"],
-                  properties: {
-                    name: { type: "string" },
-                    description: { type: "string" }
+                "schema": {
+                  "type": "object",
+                  "required": ["name"],
+                  "properties": {
+                    "name": { "type": "string" },
+                    "description": { "type": "string" }
                   }
                 }
               }
             }
           },
-          responses: { "200": { description: "Project id" } }
+          responses: { "200": { "description": "Project id" } }
+        }
+      },
+
+      "/set-default-project": {
+        post: {
+          operationId: "setDefaultProject",
+          summary: "Set an in-memory default project for this server instance.",
+          security: [{ bearerAuth: [] }],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id": { "type": "string", "description": "Optional project UUID" },
+                    "project_name": { "type": "string", "description": "Optional project name" }
+                  }
+                }
+              }
+            }
+          },
+          responses: { "200": { "description": "OK" } }
         }
       }
     },

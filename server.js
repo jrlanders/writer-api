@@ -75,63 +75,34 @@ app.post('/clear-default-project', requireAuth, (_req, res) => {
   res.json({ ok: true, message: 'Default project cleared' })
 })
 
-// ---------- Helpers ----------
 async function resolveProjectId(project_id, project_name) {
-  const pid = (project_id || '').trim()
-  const pname = (project_name || '').trim()
+  // explicit id
+  if (project_id) return project_id;
 
-  // 1) explicit id
-  if (pid) return pid
-
-  // 2) explicit name (case-insensitive)
-  if (pname) {
-    const { rows } = await pool.query(
-      `SELECT id FROM projects WHERE lower(name) = lower($1)`,
-      [pname]
-    )
-    if (!rows.length) {
-      const err = new Error(`Project not found: ${pname}`)
-      err.statusCode = 404
-      throw err
-    }
-    return rows[0].id
+  // explicit name
+  if (project_name) {
+    const { rows } = await pool.query(`SELECT id FROM projects WHERE name = $1`, [project_name]);
+    if (!rows.length) throw new Error(`Project not found: ${project_name}`);
+    return rows[0].id;
   }
 
-  // 3) in-memory session defaults (if set via /set-default-project)
-  if (defaultProjectId) return defaultProjectId
-
+  // in-memory defaults (set via /set-default-project)
+  if (defaultProjectId) return defaultProjectId;
   if (defaultProjectName) {
-    const { rows } = await pool.query(
-      `SELECT id FROM projects WHERE lower(name) = lower($1)`,
-      [defaultProjectName]
-    )
-    if (!rows.length) {
-      const err = new Error(`Default project not found: ${defaultProjectName}`)
-      err.statusCode = 404
-      throw err
-    }
-    return rows[0].id
+    const { rows } = await pool.query(`SELECT id FROM projects WHERE name = $1`, [defaultProjectName]);
+    if (!rows.length) throw new Error(`Default project not found: ${defaultProjectName}`);
+    return rows[0].id;
   }
 
-  // 4) env defaults (persist across restarts)
-  if (DEFAULT_PROJECT_ID) return DEFAULT_PROJECT_ID
+  // ENV fallbacks (persist across restarts)
+  if (DEFAULT_PROJECT_ID) return DEFAULT_PROJECT_ID;
   if (DEFAULT_PROJECT_NAME) {
-    const { rows } = await pool.query(
-      `SELECT id FROM projects WHERE lower(name) = lower($1)`,
-      [DEFAULT_PROJECT_NAME]
-    )
-    if (!rows.length) {
-      const err = new Error(`Env default project not found: ${DEFAULT_PROJECT_NAME}`)
-      err.statusCode = 404
-      throw err
-    }
-    return rows[0].id
+    const { rows } = await pool.query(`SELECT id FROM projects WHERE name = $1`, [DEFAULT_PROJECT_NAME]);
+    if (!rows.length) throw new Error(`Default project not found (env): ${DEFAULT_PROJECT_NAME}`);
+    return rows[0].id;
   }
 
-  // 5) nothing to go on
-  const err = new Error('Need project_id or project_name (no default set)')
-  err.statusCode = 400
-  throw err
+  throw new Error('Need project_id or project_name (no default set)');
 }
 
 async function retrieveTopK(projectId, query, k = 8) {

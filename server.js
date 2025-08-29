@@ -39,7 +39,18 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY })
 
 // Build tag / health
 const APP_BUILD = '2025-08-28-session-defaults-1.4.4'
-app.get('/health', (_req, res) => res.json({ ok: true, build: APP_BUILD }))
+
+// Health checks
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    build: APP_BUILD,
+    defaults: {
+      inMemory: { id: defaultProjectId, name: defaultProjectName },
+      env: { id: DEFAULT_PROJECT_ID, name: DEFAULT_PROJECT_NAME }
+    }
+  });
+});
 
 // ---------- Session default project (Option C) ----------
 // In-memory session default (set via /set-default-project).
@@ -119,18 +130,6 @@ async function retrieveTopK(projectId, query, k = 8) {
   )
   return rows
 }
-
-// Health checks
-app.get('/health', (_req, res) => {
-  res.json({
-    ok: true,
-    build: APP_BUILD,
-    defaults: {
-      inMemory: { id: defaultProjectId, name: defaultProjectName },
-      env: { id: DEFAULT_PROJECT_ID, name: DEFAULT_PROJECT_NAME }
-    }
-  });
-});
 
 // ---------- PROJECTS ----------
 app.post('/project', requireAuth, async (req, res) => {

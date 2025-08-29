@@ -58,6 +58,11 @@ app.get('/health', (_req, res) => {
 let defaultProjectId = null
 let defaultProjectName = null
 
+function coerceMeta(m) {
+  // only allow plain objects; everything else becomes {}
+  return (m && typeof m === 'object' && !Array.isArray(m)) ? m : {};
+}
+
 app.post('/set-default-project', requireAuth, async (req, res) => {
   try {
     const { project_id, project_name } = req.body || {}
@@ -232,140 +237,185 @@ app.post('/ask-stream', async (req, res) => {
 })
 
 // ---------- WRITE: save a new doc + embed ----------
+// ---------- WRITE: save a new doc + embed (with optional meta) ----------
 app.post('/ingest', requireAuth, async (req, res) => {
   try {
-    const { project_id, project_name, doc_type, title, body_md, tags = [] } = req.body || {}
+    const { project_id, project_name, doc_type, title, body_md, tags = [], meta } = req.body || {};
     if (!doc_type || !title || !body_md) {
-      return res.status(400).json({ error: 'doc_type, title, body_md required (plus project_id or project_name or a default must be set)' })
+      return res.status(400).json({ error: 'doc_type, title, body_md required (plus project_id or project_name)' });
     }
-    const pid = await resolveProjectId(project_id, project_name)
+    const pid = await resolveProjectId(project_id, project_name);
+    const metaObj = coerceMeta(meta);
 
+    // Insert the document (note: includes meta)
     const insertDocSQL = `
-      INSERT INTO documents (project_id, doc_type, title, body_md, tags, created_at, updated_at)
-      VALUES ($1,$2,$3,$4,$5, now(), now())
+      INSERT INTO documents (project_id, doc_type, title, body_md, tags, meta, created_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6, now(), now())
       RETURNING id
-    `
-    const { rows } = await pool.query(insertDocSQL, [pid, doc_type, title, body_md, tags])
-    const doc_id = rows[0].id
+    `;
+    const { rows } = await pool.query(insertDocSQL, [pid, doc_type, title, body_md, tags, JSON.stringify(metaObj)]);
+    const doc_id = rows[0].id;
 
-    const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean)
-    const chunks = paragraphs.length ? paragraphs : [body_md]
+    // Chunk text (simple: split on blank lines)
+    const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+    const chunks = paragraphs.length ? paragraphs : [body_md];
 
+    // Embed in small batches
     for (let i = 0; i < chunks.length; i += 16) {
-      const batch = chunks.slice(i, i + 16)
-      const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch })
+      const batch = chunks.slice(i, i + 16);
+      const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch });
       for (let j = 0; j < batch.length; j++) {
-        const vecStr = `[${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]`
+        const vecStr = `[${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]`;
+        const embMeta = { title, doc_type, ...metaObj }; // doc meta + basics
         await pool.query(
           `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
            VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
-          [pid, doc_id, i + j + 1, batch[j], vecStr, JSON.stringify({ title, doc_type })]
-        )
+          [pid, doc_id, i + j + 1, batch[j], vecStr, JSON.stringify(embMeta)]
+        );
       }
     }
 
-    res.json({ ok: true, document_id: doc_id })
+    res.json({ ok: true, document_id: doc_id });
   } catch (e) {
-    const code = e.statusCode || 500
-    res.status(code).json({ error: String(e.message || e) })
+    res.status(500).json({ error: String(e) });
   }
-})
+});
 
 // ---------- WRITE: update an existing doc (and re-embed if body changed) ----------
 app.post('/update', requireAuth, async (req, res) => {
   try {
-    const { document_id, project_id, project_name, title, body_md, tags } = req.body || {}
-    if (!document_id || (!title && !body_md && !tags)) {
-      return res.status(400).json({ error: 'document_id and one of title/body_md/tags required (plus project_id or project_name)' })
+    const { document_id, project_id, project_name, title, body_md, tags, meta } = req.body || {};
+    if (!document_id || (!title && !body_md && !tags && !meta)) {
+      return res.status(400).json({ error: 'document_id and one of title/body_md/tags/meta required (plus project_id or project_name)' });
     }
-    const pid = await resolveProjectId(project_id, project_name)
+    const pid = await resolveProjectId(project_id, project_name);
 
-    const sets = []
-    const vals = []
-    let idx = 1
-    if (title)   { sets.push(`title = $${idx++}`);   vals.push(title) }
-    if (body_md) { sets.push(`body_md = $${idx++}`); vals.push(body_md) }
-    if (tags)    { sets.push(`tags = $${idx++}`);    vals.push(tags) }
-    sets.push(`updated_at = now()`); vals.push(pid, document_id)
+    const sets = [];
+    const vals = [];
+    let idx = 1;
+
+    if (title)   { sets.push(`title = $${idx++}`);        vals.push(title); }
+    if (body_md) { sets.push(`body_md = $${idx++}`);      vals.push(body_md); }
+    if (tags)    { sets.push(`tags = $${idx++}`);         vals.push(tags); }
+    if (meta)    { sets.push(`meta = $${idx++}::jsonb`);  vals.push(JSON.stringify(coerceMeta(meta))); }
+
+    sets.push(`updated_at = now()`);
+    vals.push(pid, document_id);
 
     const { rowCount } = await pool.query(
       `UPDATE documents SET ${sets.join(', ')} WHERE project_id = $${idx++} AND id = $${idx}`,
       vals
-    )
-    if (rowCount === 0) return res.status(404).json({ error: 'Document not found for this project' })
+    );
+    if (rowCount === 0) return res.status(404).json({ error: 'Document not found for this project' });
 
+    // If body changed, re-embed
     if (body_md) {
-      await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id])
-      const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean)
-      const chunks = paragraphs.length ? paragraphs : [body_md]
+      await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id]);
+
+      // fetch latest doc_type + title + meta so embeddings meta stays in sync
+      const docQ = await pool.query(
+        `SELECT title, doc_type, meta FROM documents WHERE id = $1`,
+        [document_id]
+      );
+      const current = docQ.rows[0] || {};
+      const embTitle = title ?? current.title ?? '(updated)';
+      const embDocType = current.doc_type || 'update';
+      const embMetaBase = coerceMeta(meta ?? current.meta);
+
+      const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+      const chunks = paragraphs.length ? paragraphs : [body_md];
+
       for (let i = 0; i < chunks.length; i += 16) {
-        const batch = chunks.slice(i, i + 16)
-        const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch })
+        const batch = chunks.slice(i, i + 16);
+        const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch });
         for (let j = 0; j < batch.length; j++) {
-          const vecStr = `[${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]`
+          const vecStr = `[${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]`;
+          const embMeta = { title: embTitle, doc_type: embDocType, ...embMetaBase };
           await pool.query(
             `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
              VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
-            [pid, document_id, i + j + 1, batch[j], vecStr, JSON.stringify({ title: title ?? '(updated)', doc_type: 'update' })]
-          )
+            [pid, document_id, i + j + 1, batch[j], vecStr, JSON.stringify(embMeta)]
+          );
         }
       }
     }
 
-    res.json({ ok: true, document_id })
+    res.json({ ok: true, document_id });
   } catch (e) {
-    const code = e.statusCode || 500
-    res.status(code).json({ error: String(e.message || e) })
+    res.status(500).json({ error: String(e) });
   }
-})
+});
 
 // ---------- WRITE: update by title (avoids needing the UUID) ----------
 app.post('/update-by-title', requireAuth, async (req, res) => {
   try {
-    const { project_id, project_name, title, body_md, tags } = req.body || {}
-    if (!title || (!body_md && !tags)) {
-      return res.status(400).json({ error: 'title and one of body_md/tags required (plus project_id or project_name)' })
+    const { project_id, project_name, title, body_md, tags, meta } = req.body || {};
+    if (!title || (!body_md && !tags && !meta)) {
+      return res.status(400).json({ error: 'title and one of body_md/tags/meta required (plus project_id or project_name)' });
     }
-    const pid = await resolveProjectId(project_id, project_name)
+    const pid = await resolveProjectId(project_id, project_name);
 
     const found = await pool.query(
       `SELECT id FROM documents WHERE project_id = $1 AND title = $2 ORDER BY updated_at DESC LIMIT 1`,
       [pid, title]
-    )
-    if (!found.rows.length) return res.status(404).json({ error: 'Document not found' })
-    const document_id = found.rows[0].id
+    );
+    if (!found.rows.length) return res.status(404).json({ error: 'Document not found' });
 
-    const sets = []; const vals = []; let idx = 1
-    if (body_md) { sets.push(`body_md = $${idx++}`); vals.push(body_md) }
-    if (tags)    { sets.push(`tags = $${idx++}`);    vals.push(tags) }
-    sets.push(`updated_at = now()`); vals.push(pid, document_id)
+    const document_id = found.rows[0].id;
 
-    await pool.query(`UPDATE documents SET ${sets.join(', ')} WHERE project_id = $${idx++} AND id = $${idx}`, vals)
+    const sets = [];
+    const vals = [];
+    let idx = 1;
 
+    if (body_md) { sets.push(`body_md = $${idx++}`);      vals.push(body_md); }
+    if (tags)    { sets.push(`tags = $${idx++}`);         vals.push(tags); }
+    if (meta)    { sets.push(`meta = $${idx++}::jsonb`);  vals.push(JSON.stringify(coerceMeta(meta))); }
+
+    sets.push(`updated_at = now()`);
+    vals.push(pid, document_id);
+
+    await pool.query(
+      `UPDATE documents SET ${sets.join(', ')} WHERE project_id = $${idx++} AND id = $${idx}`,
+      vals
+    );
+
+    // If body changed, re-embed
     if (body_md) {
-      await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id])
-      const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean)
-      const chunks = paragraphs.length ? paragraphs : [body_md]
+      await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id]);
+
+      // read back fresh doc for consistent embedding meta
+      const docQ = await pool.query(
+        `SELECT title, doc_type, meta FROM documents WHERE id = $1`,
+        [document_id]
+      );
+      const current = docQ.rows[0] || {};
+      const embTitle = current.title || title;
+      const embDocType = current.doc_type || 'update';
+      const embMetaBase = coerceMeta(meta ?? current.meta);
+
+      const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+      const chunks = paragraphs.length ? paragraphs : [body_md];
+
       for (let i = 0; i < chunks.length; i += 16) {
-        const batch = chunks.slice(i, i + 16)
-        const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch })
+        const batch = chunks.slice(i, i + 16);
+        const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch });
         for (let j = 0; j < batch.length; j++) {
-          const vecStr = `[${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]`
+          const vecStr = `[${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]`;
+          const embMeta = { title: embTitle, doc_type: embDocType, ...embMetaBase };
           await pool.query(
             `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
              VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
-            [pid, document_id, i + j + 1, batch[j], vecStr, JSON.stringify({ title, doc_type: 'update' })]
-          )
+            [pid, document_id, i + j + 1, batch[j], vecStr, JSON.stringify(embMeta)]
+          );
         }
       }
     }
 
-    res.json({ ok: true, document_id })
+    res.json({ ok: true, document_id });
   } catch (e) {
-    const code = e.statusCode || 500
-    res.status(code).json({ error: String(e.message || e) })
+    res.status(500).json({ error: String(e) });
   }
-})
+});
 
 // ---------- LIST DOCS (filters) ----------
 app.get('/list-docs', async (req, res) => {
@@ -439,276 +489,274 @@ app.get('/doc-by-title', async (req, res) => {
 
 // ---------- OpenAPI 3.1.0 for GPT Actions ----------
 app.get('/openapi.json', (_req, res) => {
-  res.json({
-    openapi: "3.1.0",
-    info: { title: "Writer Brain API", version: "1.4.5" },
-    servers: [{ url: "https://writer-api-p0c7.onrender.com" }],
-    paths: {
-      "/ask": {
-        post: {
-          operationId: "askProject",
-          summary: "Answer a question using RAG against the current project (uses default if none provided).",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "required": ["question"],
-                  "properties": {
-                    "question": { "type": "string" },
-                    "project_id": { "type": "string", "description": "Optional. If omitted, server default is used." },
-                    "project_name": { "type": "string", "description": "Optional. If omitted, server default is used." },
-                    "history": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "properties": {
-                          "role": { "type": "string", "enum": ["system","user","assistant"] },
-                          "content": { "type": "string" }
-                        },
-                        "required": ["role","content"]
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          },
-          responses: { "200": { "description": "Answer JSON" } }
-        }
-      },
-
-      "/ingest": {
-        post: {
-          operationId: "ingestDoc",
-          summary: "Create a new document and embed it (uses default project if none provided).",
-          security: [{ bearerAuth: [] }],
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "project_id":   { "type": "string", "description": "Optional project UUID. Defaults to server/session project if omitted." },
-                    "project_name": { "type": "string", "description": "Optional project name. Defaults to server/session project if omitted." },
-                    "doc_type":     { "type": "string", "example": "concept", "description": "character | chapter | scene | concept | artifact | location | ..." },
-                    "title":        { "type": "string" },
-                    "body_md":      { "type": "string" },
-                    "tags":         { "type": "array", "items": { "type": "string" } }
-                  },
-                  "required": ["doc_type","title","body_md"]
-                }
-              }
-            }
-          },
-          responses: {
-            "200": {
-              "description": "Ingested",
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "type": "object",
-                    "properties": {
-                      "ok": { "type": "boolean" },
-                      "document_id": { "type": "string", "format": "uuid" }
+  res.json(
+  {
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Writer Brain API",
+    "version": "1.4.5"
+  },
+  "servers": [
+    { "url": "https://writer-api-p0c7.onrender.com" }
+  ],
+  "paths": {
+    "/ask": {
+      "post": {
+        "operationId": "askProject",
+        "summary": "Retrieve an answer using RAG",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["question"],
+                "properties": {
+                  "question": { "type": "string" },
+                  "project_id": { "type": "string" },
+                  "project_name": { "type": "string" },
+                  "history": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "role": { "type": "string", "enum": ["system", "user", "assistant"] },
+                        "content": { "type": "string" }
+                      },
+                      "required": ["role", "content"]
                     }
                   }
                 }
               }
             }
           }
-        }
-      },
+        },
+        "responses": { "200": { "description": "Answer JSON" } }
+      }
+    },
 
-      "/update": {
-        post: {
-          operationId: "updateDoc",
-          summary: "Update an existing document by UUID and re-embed (uses default project if none provided).",
-          security: [{ bearerAuth: [] }],
-          requestBody: {
-            required: true,
-            content: {
+    "/ingest": {
+      "post": {
+        "operationId": "ingestDoc",
+        "summary": "Create a new document and embed it",
+        "security": [ { "bearerAuth": [] } ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "project_id":   { "type": "string", "description": "UUID of project" },
+                  "project_name": { "type": "string", "description": "Human-friendly name if you don't have the UUID" },
+                  "doc_type":     { "type": "string", "example": "artifact", "description": "character | chapter | scene | concept | artifact | location | ..." },
+                  "title":        { "type": "string" },
+                  "body_md":      { "type": "string" },
+                  "tags":         { "type": "array", "items": { "type": "string" } },
+                  "meta":         { "type": "object", "additionalProperties": true }
+                },
+                "required": ["doc_type","title","body_md"],
+                "oneOf": [
+                  { "required": ["project_id"] },
+                  { "required": ["project_name"] }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Ingested",
+            "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "project_id":   { "type": "string", "description": "Optional project UUID. Defaults to server/session project if omitted." },
-                    "project_name": { "type": "string", "description": "Optional project name. Defaults to server/session project if omitted." },
-                    "document_id":  { "type": "string", "format": "uuid" },
-                    "title":        { "type": "string" },
-                    "body_md":      { "type": "string" },
-                    "tags":         { "type": "array", "items": { "type": "string" } }
-                  },
-                  "required": ["document_id"]
-                }
-              }
-            }
-          },
-          responses: {
-            "200": {
-              "description": "Updated",
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "type": "object",
-                    "properties": {
-                      "ok": { "type": "boolean" },
-                      "document_id": { "type": "string", "format": "uuid" }
-                    }
+                    "ok": { "type": "boolean" },
+                    "document_id": { "type": "string", "format": "uuid" }
                   }
                 }
               }
             }
           }
-        }
-      },
-
-      "/update-by-title": {
-        post: {
-          operationId: "updateDocByTitle",
-          summary: "Update a document by title (no UUID) and re-embed (uses default project if none provided).",
-          security: [{ bearerAuth: [] }],
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "project_id":   { "type": "string", "description": "Optional project UUID. Defaults to server/session project if omitted." },
-                    "project_name": { "type": "string", "description": "Optional project name. Defaults to server/session project if omitted." },
-                    "title":        { "type": "string", "description": "Document title to update" },
-                    "body_md":      { "type": "string" },
-                    "tags":         { "type": "array", "items": { "type": "string" } }
-                  },
-                  "required": ["title"]
-                }
-              }
-            }
-          },
-          responses: {
-            "200": {
-              "description": "Updated",
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "type": "object",
-                    "properties": {
-                      "ok": { "type": "boolean" },
-                      "document_id": { "type": "string", "format": "uuid" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      },
-
-      "/doc": {
-        get: {
-          operationId: "getDoc",
-          summary: "Get a single document by UUID (returns full body_md).",
-          parameters: [
-            { "in": "query", "name": "id", "required": true, "schema": { "type": "string", "format": "uuid" } }
-          ],
-          responses: { "200": { "description": "Document" } }
-        }
-      },
-
-      "/doc-by-title": {
-        get: {
-          operationId: "getDocByTitle",
-          summary: "Get latest doc by title (uses default project if none provided).",
-          parameters: [
-            { "in": "query", "name": "project_id",   "required": false, "schema": { "type": "string" } },
-            { "in": "query", "name": "project_name", "required": false, "schema": { "type": "string" } },
-            { "in": "query", "name": "title",        "required": true,  "schema": { "type": "string" } }
-          ],
-          responses: { "200": { "description": "Document" } }
-        }
-      },
-
-      "/list-docs": {
-        get: {
-          operationId: "listDocs",
-          summary: "List recent docs in a project (uses default project if none provided).",
-          parameters: [
-            { "in": "query", "name": "project_id",   "required": false, "schema": { "type": "string" } },
-            { "in": "query", "name": "project_name", "required": false, "schema": { "type": "string" } },
-            { "in": "query", "name": "doc_type",     "required": false, "schema": { "type": "string" }, "description": "Filter by doc_type" },
-            { "in": "query", "name": "q",            "required": false, "schema": { "type": "string" }, "description": "Search in title or tags (ILIKE)" },
-            { "in": "query", "name": "limit",        "required": false, "schema": { "type": "integer", "default": 25, "minimum": 1, "maximum": 100 } }
-          ],
-          responses: { "200": { "description": "Document list" } }
-        }
-      },
-
-      "/projects": {
-        get: {
-          operationId: "listProjects",
-          summary: "List all projects",
-          security: [{ bearerAuth: [] }],
-          responses: { "200": { "description": "Projects" } }
-        }
-      },
-
-      "/project": {
-        post: {
-          operationId: "createOrGetProject",
-          summary: "Create or get a project by name",
-          security: [{ bearerAuth: [] }],
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "required": ["name"],
-                  "properties": {
-                    "name": { "type": "string" },
-                    "description": { "type": "string" }
-                  }
-                }
-              }
-            }
-          },
-          responses: { "200": { "description": "Project id" } }
-        }
-      },
-
-      "/set-default-project": {
-        post: {
-          operationId: "setDefaultProject",
-          summary: "Set an in-memory default project for this server instance.",
-          security: [{ bearerAuth: [] }],
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "project_id": { "type": "string", "description": "Optional project UUID" },
-                    "project_name": { "type": "string", "description": "Optional project name" }
-                  }
-                }
-              }
-            }
-          },
-          responses: { "200": { "description": "OK" } }
         }
       }
     },
-    components: {
-      securitySchemes: {
-        bearerAuth: { type: "http", scheme: "bearer", bearerFormat: "JWT" }
-      },
-      schemas: {}
+
+    "/update": {
+      "post": {
+        "operationId": "updateDoc",
+        "summary": "Update an existing document by UUID and re-embed",
+        "security": [ { "bearerAuth": [] } ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "project_id":   { "type": "string", "description": "UUID of project" },
+                  "project_name": { "type": "string", "description": "Human-friendly name if you don't have the UUID" },
+                  "document_id":  { "type": "string", "format": "uuid" },
+                  "title":        { "type": "string" },
+                  "body_md":      { "type": "string" },
+                  "tags":         { "type": "array", "items": { "type": "string" } },
+                  "meta":         { "type": "object", "additionalProperties": true }
+                },
+                "required": ["document_id"],
+                "oneOf": [
+                  { "required": ["project_id","document_id"] },
+                  { "required": ["project_name","document_id"] }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": { "type": "boolean" },
+                    "document_id": { "type": "string", "format": "uuid" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "/update-by-title": {
+      "post": {
+        "operationId": "updateDocByTitle",
+        "summary": "Update a document by title (no UUID) and re-embed",
+        "security": [ { "bearerAuth": [] } ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "project_id":   { "type": "string", "description": "UUID of project" },
+                  "project_name": { "type": "string", "description": "Human-friendly project name" },
+                  "title":        { "type": "string", "description": "Document title to update" },
+                  "body_md":      { "type": "string" },
+                  "tags":         { "type": "array", "items": { "type": "string" } },
+                  "meta":         { "type": "object", "additionalProperties": true }
+                },
+                "required": ["title"],
+                "oneOf": [
+                  { "required": ["project_id","title"] },
+                  { "required": ["project_name","title"] }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": { "type": "boolean" },
+                    "document_id": { "type": "string", "format": "uuid" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "/doc": {
+      "get": {
+        "operationId": "getDoc",
+        "summary": "Get a single document by UUID (returns full body_md)",
+        "parameters": [
+          { "in": "query", "name": "id", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": { "200": { "description": "Document" } }
+      }
+    },
+
+    "/doc-by-title": {
+      "get": {
+        "operationId": "getDocByTitle",
+        "summary": "Get latest doc by title (by project name or id)",
+        "parameters": [
+          { "in": "query", "name": "project_id", "required": false, "schema": { "type": "string" } },
+          { "in": "query", "name": "project_name", "required": false, "schema": { "type": "string" } },
+          { "in": "query", "name": "title", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Document" } }
+      }
+    },
+
+    "/list-docs": {
+      "get": {
+        "operationId": "listDocs",
+        "summary": "List recent docs in a project",
+        "parameters": [
+          { "in": "query", "name": "project_id",   "required": false, "schema": { "type": "string" } },
+          { "in": "query", "name": "project_name", "required": false, "schema": { "type": "string" } },
+          { "in": "query", "name": "doc_type",     "required": false, "schema": { "type": "string" }, "description": "Filter by doc_type (e.g., character, note, chapter)" },
+          { "in": "query", "name": "q",            "required": false, "schema": { "type": "string" }, "description": "Search in title or tags (ILIKE)" },
+          { "in": "query", "name": "limit",        "required": false, "schema": { "type": "integer", "default": 25, "minimum": 1, "maximum": 100 } }
+        ],
+        "responses": { "200": { "description": "Document list" } }
+      }
+    },
+
+    "/projects": {
+      "get": {
+        "operationId": "listProjects",
+        "summary": "List all projects",
+        "security": [ { "bearerAuth": [] } ],
+        "responses": { "200": { "description": "Projects" } }
+      }
+    },
+
+    "/project": {
+      "post": {
+        "operationId": "createOrGetProject",
+        "summary": "Create or get a project by name",
+        "security": [ { "bearerAuth": [] } ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "description": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Project id" } }
+      }
     }
-  })
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": { "type": "http", "scheme": "bearer", "bearerFormat": "JWT" }
+    },
+    "schemas": {}
+  }
+})
 })
 
 // ---- Start ----

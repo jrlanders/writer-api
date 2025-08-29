@@ -542,6 +542,48 @@ app.get('/openapi.json', (_req, res) => {
           }
         }
       },
+      "/set-default-project": {
+        "post": {
+          "operationId": "setDefaultProject",
+          "summary": "Set the default project for this session (name or id)",
+          "security": [{ "bearerAuth": [] }],
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "project_id":   { "type": "string", "description": "UUID of project" },
+                    "project_name": { "type": "string", "description": "Human-friendly project name" }
+                  },
+                  "oneOf": [
+                    { "required": ["project_id"] },
+                    { "required": ["project_name"] }
+                  ]
+                }
+              }
+            }
+          },
+          "responses": {
+            "200": {
+              "description": "Default set",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "ok": { "type": "boolean" },
+                      "defaultProjectId": { "type": "string" },
+                      "defaultProjectName": { "type": "string" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
       "/update": {
         post: {
           operationId: "updateDoc",

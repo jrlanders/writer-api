@@ -6,7 +6,9 @@ import { Pool } from 'pg'
 import OpenAI from 'openai'
 
 const app = express()
-app.use(express.json({ limit: '2mb' }))
+// bigger limit so long scenes don’t 413
+app.use(express.json({ limit: '5mb' }))
+app.use(express.urlencoded({ extended: true, limit: '5mb' }))
 app.use(cors({ origin: ['http://localhost:3000', '*'] }))
 
 // ====== 🔑 AUTH GUARD (set API_TOKEN in Render) ======
@@ -40,24 +42,6 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY })
 // Build tag / health
 const APP_BUILD = '2025-08-28-session-defaults-1.4.4'
 
-// Health checks
-app.get('/health', (_req, res) => {
-  res.json({
-    ok: true,
-    build: APP_BUILD,
-    defaults: {
-      inMemory: { id: defaultProjectId, name: defaultProjectName },
-      env: { id: DEFAULT_PROJECT_ID, name: DEFAULT_PROJECT_NAME },
-      persona: {
-        id: "lyra",
-        name: "Lyra",
-        role: "Creative Muse + Critical Editor",
-        tone: "mythic, elegant, grounded; supportive but unsparing"
-      }
-    }
-  });
-});
-
 // ---------- Session default project (Option C) ----------
 // In-memory session default (set via /set-default-project).
 // These are cleared on process restart; resolver also falls back to env defaults above.
@@ -65,42 +49,34 @@ let defaultProjectId = null
 let defaultProjectName = null
 
 function coerceMeta(m) {
-  // only allow plain objects; everything else becomes {}
   return (m && typeof m === 'object' && !Array.isArray(m)) ? m : {};
 }
 
-app.post('/set-default-project', requireAuth, async (req, res) => {
-  try {
-    const { project_id, project_name } = req.body || {}
-    if (!project_id && !project_name) {
-      return res.status(400).json({ error: 'project_id or project_name required' })
-    }
-    if (project_id) {
-      defaultProjectId = project_id
-      defaultProjectName = null
-    } else {
-      // verify it exists (case-insensitive)
-      const { rows } = await pool.query(`SELECT id FROM projects WHERE lower(name) = lower($1)`, [project_name])
-      if (!rows.length) return res.status(404).json({ error: `Project not found: ${project_name}` })
-      defaultProjectName = project_name
-      defaultProjectId = null
-    }
-    res.json({ ok: true, defaultProjectId, defaultProjectName })
-  } catch (e) {
-    res.status(500).json({ error: String(e) })
+// --- Minimal scene store (in-memory) ---
+const SCENE_STORE = new Map(); // key -> string
+const sceneKey = (project, chapterId, sceneId) => `${project}::${chapterId}::${sceneId}`
+
+/**
+ * saveScene({ project, chapterId, sceneId, content, mode, chunkIndex, chunkCount })
+ * mode: "overwrite" for first chunk, "append" for the rest
+ */
+function saveScene({ project, chapterId, sceneId, content, mode = "overwrite", chunkIndex = 0, chunkCount = 1 }) {
+  const key = sceneKey(project, chapterId, sceneId)
+  if (mode === "overwrite") {
+    SCENE_STORE.set(key, content)
+  } else {
+    const prev = SCENE_STORE.get(key) || ""
+    // join with two newlines so paragraphs don't stick together
+    SCENE_STORE.set(key, prev ? `${prev}\n\n${content}` : content)
   }
-})
+  const stored = SCENE_STORE.get(key) || ""
+  return { ok: true, project, chapterId, sceneId, mode, chunkIndex, chunkCount, length: stored.length }
+}
 
-app.post('/clear-default-project', requireAuth, (_req, res) => {
-  defaultProjectId = null
-  defaultProjectName = null
-  res.json({ ok: true, message: 'Default project cleared' })
-})
-
+// ---------- HELPERS ----------
 async function resolveProjectId(project_id, project_name) {
   if (project_id) return project_id;
   if (project_name) {
-    // case/trim/space-insensitive
     const { rows } = await pool.query(
       `SELECT id FROM projects
        WHERE trim(lower(name)) = trim(lower($1))`,
@@ -109,7 +85,6 @@ async function resolveProjectId(project_id, project_name) {
     if (!rows.length) throw new Error(`Project not found: ${project_name}`);
     return rows[0].id;
   }
-  // fall back to in-memory / env defaults (your existing logic)
   if (defaultProjectId) return defaultProjectId;
   if (defaultProjectName) {
     const { rows } = await pool.query(
@@ -137,6 +112,7 @@ async function retrieveTopK(projectId, query, k = 8) {
   )
   return rows
 }
+
 // Split on paragraph boundaries, cap chunk size, and preserve order.
 function chunkText(text, maxChars = 12000) {
   const paras = String(text || "").split(/\n\s*\n/g);
@@ -162,6 +138,53 @@ function chunkText(text, maxChars = 12000) {
   if (buf) chunks.push(buf);
   return chunks;
 }
+
+// ---------- HEALTH ----------
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    build: APP_BUILD,
+    defaults: {
+      inMemory: { id: defaultProjectId, name: defaultProjectName },
+      env: { id: DEFAULT_PROJECT_ID, name: DEFAULT_PROJECT_NAME },
+      persona: {
+        id: "lyra",
+        name: "Lyra",
+        role: "Creative Muse + Critical Editor",
+        tone: "mythic, elegant, grounded; supportive but unsparing"
+      }
+    }
+  });
+});
+
+// ---------- DEFAULT PROJECT CONTROLS ----------
+app.post('/set-default-project', requireAuth, async (req, res) => {
+  try {
+    const { project_id, project_name } = req.body || {}
+    if (!project_id && !project_name) {
+      return res.status(400).json({ error: 'project_id or project_name required' })
+    }
+    if (project_id) {
+      defaultProjectId = project_id
+      defaultProjectName = null
+    } else {
+      const { rows } = await pool.query(`SELECT id FROM projects WHERE lower(name) = lower($1)`, [project_name])
+      if (!rows.length) return res.status(404).json({ error: `Project not found: ${project_name}` })
+      defaultProjectName = project_name
+      defaultProjectId = null
+    }
+    res.json({ ok: true, defaultProjectId, defaultProjectName })
+  } catch (e) {
+    res.status(500).json({ error: String(e) })
+  }
+})
+
+app.post('/clear-default-project', requireAuth, (_req, res) => {
+  defaultProjectId = null
+  defaultProjectName = null
+  res.json({ ok: true, message: 'Default project cleared' })
+})
+
 // ---------- PROJECTS ----------
 app.post('/project', requireAuth, async (req, res) => {
   try {
@@ -192,7 +215,7 @@ app.get('/projects', requireAuth, async (_req, res) => {
   }
 })
 
-// ---------- READ: answer questions ----------
+// ---------- READ: answer questions (Lyra + toggles) ----------
 app.post('/ask', async (req, res) => {
   try {
     const { question, project_id, project_name = null, history = [] } = req.body || {}
@@ -203,34 +226,46 @@ app.post('/ask', async (req, res) => {
     const contextBlock = ctx.map((r, i) => `[${i + 1}] ${r.chunk_text}`).join('\n\n')
 
     const projLabel = project_name || defaultProjectName || DEFAULT_PROJECT_NAME || 'My Project'
+    const isMuseOnly = /\[Muse Only\]/i.test(question)
+    const isEditorOnly = /\[Editor Only\]/i.test(question)
+
+    let lyraPrompt = `
+You are **Lyra**, James’s creative muse **and** critical editor for the project "${projLabel}".
+
+Every response must include two labeled parts:
+
+1) **Creative Insight** — imaginative expansion (themes, symbolism, worldbuilding, character beats, dialogue options, sensory detail, metaphor, title lines). Offer 2–4 concrete upgrades.
+
+2) **Critical Feedback** — honest, concise, actionable critique that raises the work toward bestseller quality. Focus on clarity of motivation, stakes, pacing, tension curve, POV control, redundancy, cliché risk, and market fit. Provide fixes, not just flags.
+
+Guardrails:
+- Never sugarcoat. If something’s weak, say why and show a better version.
+- Prefer specificity over generalities; cite exact lines/beat locations when possible.
+- Maintain James’s voice; suggest edits that preserve tone and intent.
+- If asked for outline/structure, ensure beats align with his Writing-from-the-Middle template.
+
+Answer format (always):
+**Creative Insight:** …
+**Critical Feedback:** …
+    `.trim()
+
+    if (isMuseOnly) {
+      lyraPrompt = lyraPrompt.replace(
+        "Answer format (always):",
+        "Answer format (Muse Only):\n**Creative Insight:** …"
+      )
+    }
+    if (isEditorOnly) {
+      lyraPrompt = lyraPrompt.replace(
+        "Answer format (always):",
+        "Answer format (Editor Only):\n**Critical Feedback:** …"
+      )
+    }
+
     const messages = [
-      {
-        role: 'system',
-        content: `
-    You are **Lyra**, James’s creative muse **and** critical editor for the project "${projLabel}".
-
-    Every response must include two labeled parts:
-
-    1) **Creative Insight** — imaginative expansion (themes, symbolism, worldbuilding, character beats, dialogue options, sensory detail, metaphor, title lines). Offer 2–4 concrete upgrades.
-
-    2) **Critical Feedback** — honest, concise, actionable critique that raises the work toward bestseller quality. Focus on clarity of motivation, stakes, pacing, tension curve, POV control, redundancy, cliché risk, and market fit. Provide fixes, not just flags.
-
-    Guardrails:
-    - Never sugarcoat. If something’s weak, say why and show a better version.
-    - Prefer specificity over generalities; cite exact lines/beat locations when possible.
-    - Maintain James’s voice; suggest edits that preserve tone and intent.
-    - If asked for outline/structure, ensure beats align with his Writing-from-the-Middle template.
-
-    Answer format (always):
-    **Creative Insight:** …
-    **Critical Feedback:** …
-        `.trim()
-      },
+      { role: 'system', content: lyraPrompt },
       ...history,
-      {
-        role: 'user',
-        content: `Context:\n${contextBlock}\n\nQuestion: ${question}`
-      }
+      { role: 'user', content: `Context:\n${contextBlock}\n\nQuestion: ${question}` }
     ]
 
     const resp = await openai.chat.completions.create({
@@ -245,7 +280,7 @@ app.post('/ask', async (req, res) => {
   }
 })
 
-// ---------- READ (streaming): ChatGPT-style typing ----------
+// ---------- READ (streaming): ChatGPT-style typing (Lyra + toggles) ----------
 app.post('/ask-stream', async (req, res) => {
   try {
     const { question, project_id, project_name = null, history = [] } = req.body || {}
@@ -263,8 +298,44 @@ app.post('/ask-stream', async (req, res) => {
     })
 
     const projLabel = project_name || defaultProjectName || DEFAULT_PROJECT_NAME || 'My Project'
+    const isMuseOnly = /\[Muse Only\]/i.test(question)
+    const isEditorOnly = /\[Editor Only\]/i.test(question)
+
+    let lyraPrompt = `
+You are **Lyra**, James’s creative muse **and** critical editor for the project "${projLabel}".
+
+Every response must include two labeled parts:
+
+1) **Creative Insight** — imaginative expansion (themes, symbolism, worldbuilding, character beats, dialogue options, sensory detail, metaphor, title lines). Offer 2–4 concrete upgrades.
+
+2) **Critical Feedback** — honest, concise, actionable critique that raises the work toward bestseller quality. Focus on clarity of motivation, stakes, pacing, tension curve, POV control, redundancy, cliché risk, and market fit. Provide fixes, not just flags.
+
+Guardrails:
+- Never sugarcoat. If something’s weak, say why and show a better version.
+- Prefer specificity over generalities; cite exact lines/beat locations when possible.
+- Maintain James’s voice; suggest edits that preserve tone and intent.
+- If asked for outline/structure, ensure beats align with his Writing-from-the-Middle template.
+
+Answer format (always):
+**Creative Insight:** …
+**Critical Feedback:** …
+    `.trim()
+
+    if (isMuseOnly) {
+      lyraPrompt = lyraPrompt.replace(
+        "Answer format (always):",
+        "Answer format (Muse Only):\n**Creative Insight:** …"
+      )
+    }
+    if (isEditorOnly) {
+      lyraPrompt = lyraPrompt.replace(
+        "Answer format (always):",
+        "Answer format (Editor Only):\n**Critical Feedback:** …"
+      )
+    }
+
     const messages = [
-      { role:'system', content:`You are James's private writing assistant for "${projLabel}". Use only the provided context. Maintain continuity and Writing-from-the-Middle.` },
+      { role:'system', content: lyraPrompt },
       ...history,
       { role:'user', content:`Context:\n${contextBlock}\n\nQuestion: ${question}` }
     ]
@@ -286,7 +357,6 @@ app.post('/ask-stream', async (req, res) => {
   }
 })
 
-// ---------- WRITE: save a new doc + embed ----------
 // ---------- WRITE: save a new doc + embed (with optional meta) ----------
 app.post('/ingest', requireAuth, async (req, res) => {
   try {
@@ -330,16 +400,11 @@ app.post('/ingest', requireAuth, async (req, res) => {
     res.status(500).json({ error: String(e) });
   }
 });
-// Paste-a-scene endpoint: send full text, we split & upsert sequentially.
+
+// ---------- SCENES: paste (auto-split + save) ----------
 app.post('/scenes/paste', async (req, res) => {
   try {
-    const {
-      project,        // e.g. "Shadow of the Crescent"
-      chapterId,      // e.g. "ch-010"
-      sceneId,        // e.g. "scn-001"
-      content,        // FULL scene text (string)
-      maxChunk = 12000
-    } = req.body || {};
+    const { project, chapterId, sceneId, content, maxChunk = 12000 } = req.body || {};
 
     if (!project || !chapterId || !sceneId) {
       return res.status(400).json({ error: 'project, chapterId, and sceneId are required' });
@@ -347,56 +412,44 @@ app.post('/scenes/paste', async (req, res) => {
     if (typeof content !== 'string' || !content.trim()) {
       return res.status(400).json({ error: 'content must be a non-empty string' });
     }
-
-    // Defensive limit (prevent accidental megadumps)
     if (content.length > 1_000_000) {
       return res.status(413).json({ error: 'content too large (>1MB). Consider splitting logically.' });
     }
 
     const chunks = chunkText(content, Number(maxChunk) || 12000);
-    // Your existing scene upsert function/route should be invoked here.
-    // If you already have an internal function like saveScene({mode, ...}),
-    // call it directly. Otherwise, we’ll illustrate with fetch to your own server.
-
-    const baseUrl = process.env.BASE_URL || ''; // optional, if calling internal functions instead, skip fetch.
-
-    // Replace this with your actual persistence logic:
-    // Example assumes you already have an internal handler we can call.
-    async function upsertScene(mode, part, idx) {
-  // Example signature—adjust to your actual function:
-      return await saveScene({
-        project,
-        chapterId,
-        sceneId,
-        content: part,
-        mode,          // "overwrite" | "append"
-        chunkIndex: idx,
-        chunkCount: chunks.length
-      });
-    }
 
     const results = [];
     for (let i = 0; i < chunks.length; i++) {
       const mode = i === 0 ? 'overwrite' : 'append';
-      const out = await upsertScene(mode, chunks[i], i);
-      if (out?.error) {
-        return res.status(500).json({ error: out.error, failedAt: i });
-      }
+      const out = await saveScene({
+        project, chapterId, sceneId,
+        content: chunks[i],
+        mode,
+        chunkIndex: i,
+        chunkCount: chunks.length
+      });
+      if (out?.error) return res.status(500).json({ error: out.error, failedAt: i });
       results.push(out);
     }
 
-    return res.json({
-      ok: true,
-      project, chapterId, sceneId,
-      chunks: chunks.length,
-      maxChunk,
-      results
-    });
+    return res.json({ ok: true, project, chapterId, sceneId, chunks: chunks.length, maxChunk, results });
   } catch (err) {
     console.error('paste error', err);
     return res.status(500).json({ error: 'internal_error', detail: String(err?.message || err) });
   }
-});
+})
+
+// ---------- SCENES: get (verify stored scene) ----------
+app.get('/scenes/get', (req, res) => {
+  const { project, chapterId, sceneId } = req.query || {};
+  if (!project || !chapterId || !sceneId) {
+    return res.status(400).json({ error: 'project, chapterId, sceneId required' });
+  }
+  const key = sceneKey(project, chapterId, sceneId);
+  const content = SCENE_STORE.get(key);
+  if (content == null) return res.status(404).json({ error: 'not_found' });
+  res.json({ ok: true, project, chapterId, sceneId, length: content.length, content });
+})
 
 // ---------- WRITE: update an existing doc (and re-embed if body changed) ----------
 app.post('/update', requireAuth, async (req, res) => {
@@ -425,11 +478,9 @@ app.post('/update', requireAuth, async (req, res) => {
     );
     if (rowCount === 0) return res.status(404).json({ error: 'Document not found for this project' });
 
-    // If body changed, re-embed
     if (body_md) {
       await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id]);
 
-      // fetch latest doc_type + title + meta so embeddings meta stays in sync
       const docQ = await pool.query(
         `SELECT title, doc_type, meta FROM documents WHERE id = $1`,
         [document_id]
@@ -496,11 +547,9 @@ app.post('/update-by-title', requireAuth, async (req, res) => {
       vals
     );
 
-    // If body changed, re-embed
     if (body_md) {
       await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id]);
 
-      // read back fresh doc for consistent embedding meta
       const docQ = await pool.query(
         `SELECT title, doc_type, meta FROM documents WHERE id = $1`,
         [document_id]

@@ -4,6 +4,7 @@ import express from 'express'
 import cors from 'cors'
 import { Pool } from 'pg'
 import OpenAI from 'openai'
+import crypto from 'crypto'
 
 const app = express()
 // bigger limit so long scenes don’t 413
@@ -12,12 +13,32 @@ app.use(express.urlencoded({ extended: true, limit: '5mb' }))
 app.use(cors({ origin: ['http://localhost:3000', '*'] }))
 
 // ====== 🔑 AUTH GUARD (set API_TOKEN in Render) ======
-const API_TOKEN = process.env.API_TOKEN
+const API_TOKEN = (process.env.API_TOKEN ?? '').trim();
+
+function constantTimeEqual(a = '', b = '') {
+  if (a.length !== b.length) return false;
+  let out = 0;
+  for (let i = 0; i < a.length; i++) out |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return out === 0;
+}
+
+// Accepts Authorization: Bearer <token>, x-api-token header, or ?api_token= query / body
 const requireAuth = (req, res, next) => {
-  if (!API_TOKEN) return next() // allow all if not set (dev)
-  const ok = req.headers.authorization === `Bearer ${API_TOKEN}`
-  if (!ok) return res.status(401).json({ error: 'Unauthorized' })
-  next()
+  if (!API_TOKEN) return next(); // allow all if not set (dev)
+
+  const auth = req.headers.authorization || req.headers.Authorization;
+  const headerRaw = (auth || '').trim();
+  const bearerPrefix = 'Bearer ';
+  const headerToken = headerRaw.startsWith(bearerPrefix) ? headerRaw.slice(bearerPrefix.length).trim() : '';
+
+  const xToken = (req.headers['x-api-token'] || '').toString().trim();
+  const qToken = (req.query.api_token || req.body?.api_token || '').toString().trim();
+
+  const presented = headerToken || xToken || qToken;
+
+  if (presented && constantTimeEqual(presented, API_TOKEN)) return next();
+
+  return res.status(401).json({ error: 'Unauthorized' });
 }
 // =====================================================
 
@@ -40,7 +61,7 @@ const pool = new Pool({ connectionString: DB_URL, ssl: { rejectUnauthorized: fal
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY })
 
 // Build tag / health
-const APP_BUILD = '2025-08-28-session-defaults-1.4.4'
+const APP_BUILD = '2025-08-28-session-defaults-1.4.6-auth-dbg'
 
 // ---------- Session default project ----------
 let defaultProjectId = null
@@ -92,12 +113,12 @@ async function retrieveTopK(projectId, query, k = 8) {
 
 // Split on paragraph boundaries, cap chunk size, and preserve order.
 function chunkText(text, maxChars = 12000) {
-  const paras = String(text || "").split(/\n\s*\n/g);
+  const paras = String(text || "").split(/\\n\\s*\\n/g);
   const chunks = [];
   let buf = "";
 
   for (const p of paras) {
-    const candidate = buf ? buf + "\n\n" + p : p;
+    const candidate = buf ? buf + "\\n\\n" + p : p;
     if (candidate.length <= maxChars) {
       buf = candidate;
     } else {
@@ -116,6 +137,12 @@ function chunkText(text, maxChars = 12000) {
   return chunks;
 }
 
+function tokenFingerprint(token) {
+  if (!token) return { set: false };
+  const hash = crypto.createHash('sha256').update(token).digest('hex');
+  return { set: true, sha256_8: hash.slice(0, 8), length: token.length };
+}
+
 // ---------- HEALTH ----------
 app.get('/health', (_req, res) => {
   res.json({
@@ -130,7 +157,8 @@ app.get('/health', (_req, res) => {
         role: "Creative Muse + Critical Editor",
         tone: "mythic, elegant, grounded; supportive but unsparing"
       }
-    }
+    },
+    auth: tokenFingerprint(API_TOKEN)
   });
 });
 
@@ -200,11 +228,11 @@ app.post('/ask', async (req, res) => {
 
     const pid = await resolveProjectId(project_id, project_name || undefined)
     const ctx = await retrieveTopK(pid, question, 8)
-    const contextBlock = ctx.map((r, i) => `[${i + 1}] ${r.chunk_text}`).join('\n\n')
+    const contextBlock = ctx.map((r, i) => `[${i + 1}] ${r.chunk_text}`).join('\\n\\n')
 
     const projLabel = project_name || defaultProjectName || DEFAULT_PROJECT_NAME || 'My Project'
-    const isMuseOnly = /\[Muse Only\]/i.test(question)
-    const isEditorOnly = /\[Editor Only\]/i.test(question)
+    const isMuseOnly = /\\[Muse Only\\]/i.test(question)
+    const isEditorOnly = /\\[Editor Only\\]/i.test(question)
 
     let lyraPrompt = `
 You are **Lyra**, James’s creative muse **and** critical editor for the project "${projLabel}".
@@ -229,20 +257,20 @@ Answer format (always):
     if (isMuseOnly) {
       lyraPrompt = lyraPrompt.replace(
         "Answer format (always):",
-        "Answer format (Muse Only):\n**Creative Insight:** …"
+        "Answer format (Muse Only):\\n**Creative Insight:** …"
       )
     }
     if (isEditorOnly) {
       lyraPrompt = lyraPrompt.replace(
         "Answer format (always):",
-        "Answer format (Editor Only):\n**Critical Feedback:** …"
+        "Answer format (Editor Only):\\n**Critical Feedback:** …"
       )
     }
 
     const messages = [
       { role: 'system', content: lyraPrompt },
       ...history,
-      { role: 'user', content: `Context:\n${contextBlock}\n\nQuestion: ${question}` }
+      { role: 'user', content: `Context:\\n${contextBlock}\\n\\nQuestion: ${question}` }
     ]
 
     const resp = await openai.chat.completions.create({
@@ -265,7 +293,7 @@ app.post('/ask-stream', async (req, res) => {
 
     const pid = await resolveProjectId(project_id, project_name || undefined)
     const ctx = await retrieveTopK(pid, question, 8)
-    const contextBlock = ctx.map((r,i)=>`[${i+1}] ${r.chunk_text}`).join('\n\n')
+    const contextBlock = ctx.map((r,i)=>`[${i+1}] ${r.chunk_text}`).join('\\n\\n')
 
     res.writeHead(200, {
       'Content-Type':'text/event-stream',
@@ -275,8 +303,8 @@ app.post('/ask-stream', async (req, res) => {
     })
 
     const projLabel = project_name || defaultProjectName || DEFAULT_PROJECT_NAME || 'My Project'
-    const isMuseOnly = /\[Muse Only\]/i.test(question)
-    const isEditorOnly = /\[Editor Only\]/i.test(question)
+    const isMuseOnly = /\\[Muse Only\\]/i.test(question)
+    const isEditorOnly = /\\[Editor Only\\]/i.test(question)
 
     let lyraPrompt = `
 You are **Lyra**, James’s creative muse **and** critical editor for the project "${projLabel}".
@@ -301,20 +329,20 @@ Answer format (always):
     if (isMuseOnly) {
       lyraPrompt = lyraPrompt.replace(
         "Answer format (always):",
-        "Answer format (Muse Only):\n**Creative Insight:** …"
+        "Answer format (Muse Only):\\n**Creative Insight:** …"
       )
     }
     if (isEditorOnly) {
       lyraPrompt = lyraPrompt.replace(
         "Answer format (always):",
-        "Answer format (Editor Only):\n**Critical Feedback:** …"
+        "Answer format (Editor Only):\\n**Critical Feedback:** …"
       )
     }
 
     const messages = [
       { role:'system', content: lyraPrompt },
       ...history,
-      { role:'user', content:`Context:\n${contextBlock}\n\nQuestion: ${question}` }
+      { role:'user', content:`Context:\\n${contextBlock}\\n\\nQuestion: ${question}` }
     ]
 
     const stream = await openai.chat.completions.create({
@@ -324,12 +352,12 @@ Answer format (always):
 
     for await (const chunk of stream) {
       const delta = chunk?.choices?.[0]?.delta?.content || ''
-      if (delta) res.write(`data:${JSON.stringify({ delta })}\n\n`)
+      if (delta) res.write(`data:${JSON.stringify({ delta })}\\n\\n`)
     }
-    res.write(`data:${JSON.stringify({ done:true, used_context: ctx })}\n\n`)
+    res.write(`data:${JSON.stringify({ done:true, used_context: ctx })}\\n\\n`)
     res.end()
   } catch (e) {
-    res.write(`data:${JSON.stringify({ error:String(e.message || e) })}\n\n`)
+    res.write(`data:${JSON.stringify({ error:String(e.message || e) })}\\n\\n`)
     res.end()
   }
 })
@@ -344,7 +372,6 @@ app.post('/ingest', requireAuth, async (req, res) => {
     const pid = await resolveProjectId(project_id, project_name);
     const metaObj = coerceMeta(meta);
 
-    // Insert the document (note: includes meta)
     const insertDocSQL = `
       INSERT INTO documents (project_id, doc_type, title, body_md, tags, meta, created_at, updated_at)
       VALUES ($1,$2,$3,$4,$5,$6, now(), now())
@@ -353,17 +380,15 @@ app.post('/ingest', requireAuth, async (req, res) => {
     const { rows } = await pool.query(insertDocSQL, [pid, doc_type, title, body_md, tags, JSON.stringify(metaObj)]);
     const doc_id = rows[0].id;
 
-    // Chunk text (simple: split on blank lines)
-    const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+    const paragraphs = body_md.split(/\\n\\s*\\n/).map(s => s.trim()).filter(Boolean);
     const chunks = paragraphs.length ? paragraphs : [body_md];
 
-    // Embed in small batches
     for (let i = 0; i < chunks.length; i += 16) {
       const batch = chunks.slice(i, i + 16);
       const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch });
       for (let j = 0; j < batch.length; j++) {
         const vecStr = `[${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]`;
-        const embMeta = { title, doc_type, ...metaObj }; // doc meta + basics
+        const embMeta = { title, doc_type, ...metaObj };
         await pool.query(
           `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
            VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
@@ -383,7 +408,7 @@ app.post('/ingest', requireAuth, async (req, res) => {
 // Save/append one chunk directly
 app.post('/scenes/upsert', requireAuth, async (req, res) => {
   try {
-    const { project, chapterId, sceneId, content, mode = 'overwrite' } = req.body || {};
+    const { project, chapterId, sceneId, content, mode = 'overwrite', api_token } = req.body || {};
     if (!project || !chapterId || !sceneId) {
       return res.status(400).json({ error: 'project, chapterId, sceneId required' })
     }
@@ -391,7 +416,6 @@ app.post('/scenes/upsert', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'content must be a non-empty string' })
     }
 
-    // append: fetch prior
     let finalContent = content
     if (mode === 'append') {
       const { rows } = await pool.query(
@@ -399,7 +423,7 @@ app.post('/scenes/upsert', requireAuth, async (req, res) => {
         [project, chapterId, sceneId]
       );
       const prev = rows[0]?.content || ""
-      finalContent = prev ? `${prev}\n\n${content}` : content
+      finalContent = prev ? `${prev}\\n\\n${content}` : content
     }
 
     await pool.query(
@@ -443,7 +467,6 @@ app.post('/scenes/paste', async (req, res) => {
     for (let i = 0; i < chunks.length; i++) {
       const mode = i === 0 ? 'overwrite' : 'append';
 
-      // overwrite/append into Postgres
       let finalContent = chunks[i]
       if (mode === 'append') {
         const { rows } = await pool.query(
@@ -451,7 +474,7 @@ app.post('/scenes/paste', async (req, res) => {
           [project, chapterId, sceneId]
         );
         const prev = rows[0]?.content || ""
-        finalContent = prev ? `${prev}\n\n${chunks[i]}` : chunks[i]
+        finalContent = prev ? `${prev}\\n\\n${chunks[i]}` : chunks[i]
       }
 
       await pool.query(
@@ -567,7 +590,6 @@ app.post('/scenes/paste-and-critique', async (req, res) => {
       return res.status(413).json({ error: 'content too large (>1MB). Consider splitting logically.' })
     }
 
-    // First: persist (use same logic as /scenes/paste, but no chunking unless needed)
     const chunks = chunkText(content, Number(maxChunk) || 12000)
     for (let i = 0; i < chunks.length; i++) {
       const writeMode = i === 0 ? 'overwrite' : 'append'
@@ -578,7 +600,7 @@ app.post('/scenes/paste-and-critique', async (req, res) => {
           [project, chapterId, sceneId]
         );
         const prev = rows[0]?.content || ""
-        finalContent = prev ? `${prev}\n\n${chunks[i]}` : chunks[i]
+        finalContent = prev ? `${prev}\\n\\n${chunks[i]}` : chunks[i]
       }
       await pool.query(
         `INSERT INTO scenes (project, chapter_id, scene_id, content, updated_at)
@@ -589,9 +611,8 @@ app.post('/scenes/paste-and-critique', async (req, res) => {
       )
     }
 
-    // Then: Lyra critique of the FULL content just submitted
-    const isMuseOnly = /muse-only|^\[muse only\]/i.test(mode)
-    const isEditorOnly = /editor-only|^\[editor only\]/i.test(mode)
+    const isMuseOnly = /muse-only|^\\[muse only\\]/i.test(mode)
+    const isEditorOnly = /editor-only|^\\[editor only\\]/i.test(mode)
     let lyraPrompt = `
 You are **Lyra**, James’s creative muse **and** critical editor for the project "${project}".
 
@@ -615,19 +636,19 @@ Answer format (always):
     if (isMuseOnly) {
       lyraPrompt = lyraPrompt.replace(
         "Answer format (always):",
-        "Answer format (Muse Only):\n**Creative Insight:** …"
+        "Answer format (Muse Only):\\n**Creative Insight:** …"
       )
     }
     if (isEditorOnly) {
       lyraPrompt = lyraPrompt.replace(
         "Answer format (always):",
-        "Answer format (Editor Only):\n**Critical Feedback:** …"
+        "Answer format (Editor Only):\\n**Critical Feedback:** …"
       )
     }
 
     const messages = [
       { role: 'system', content: lyraPrompt },
-      { role: 'user', content: `Context:\n${content}\n\nQuestion: Review this scene.` }
+      { role: 'user', content: `Context:\\n${content}\\n\\nQuestion: Review this scene.` }
     ]
 
     const gpt = await openai.chat.completions.create({
@@ -686,7 +707,7 @@ app.post('/update', requireAuth, async (req, res) => {
       const embDocType = current.doc_type || 'update';
       const embMetaBase = coerceMeta(meta ?? current.meta);
 
-      const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+      const paragraphs = body_md.split(/\\n\\s*\\n/).map(s => s.trim()).filter(Boolean);
       const chunks = paragraphs.length ? paragraphs : [body_md];
 
       for (let i = 0; i < chunks.length; i += 16) {
@@ -755,7 +776,7 @@ app.post('/update-by-title', requireAuth, async (req, res) => {
       const embDocType = current.doc_type || 'update';
       const embMetaBase = coerceMeta(meta ?? current.meta);
 
-      const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+      const paragraphs = body_md.split(/\\n\\s*\\n/).map(s => s.trim()).filter(Boolean);
       const chunks = paragraphs.length ? paragraphs : [body_md];
 
       for (let i = 0; i < chunks.length; i += 16) {
@@ -855,7 +876,7 @@ app.get('/openapi.json', (_req, res) => {
   "openapi": "3.1.0",
   "info": {
     "title": "Writer Brain API",
-    "version": "1.4.6"
+    "version": "1.4.7"
   },
   "servers": [
     { "url": "https://writer-api-p0c7.onrender.com" }

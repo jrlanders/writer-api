@@ -61,7 +61,10 @@ const pool = new Pool({ connectionString: DB_URL, ssl: { rejectUnauthorized: fal
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY })
 
 // Build tag / health
-const APP_BUILD = '2025-08-28-session-defaults-1.4.6-auth-dbg'
+const APP_BUILD = '2025-08-30-1.5.0-lyra-paste-modes'
+
+// Attach build header for easy verification
+app.use((req,res,next) => { res.setHeader('X-App-Build', APP_BUILD); next(); });
 
 // ---------- Session default project ----------
 let defaultProjectId = null
@@ -113,12 +116,12 @@ async function retrieveTopK(projectId, query, k = 8) {
 
 // Split on paragraph boundaries, cap chunk size, and preserve order.
 function chunkText(text, maxChars = 12000) {
-  const paras = String(text || "").split(/\\n\\s*\\n/g);
+  const paras = String(text || "").split(/\n\s*\n/g);
   const chunks = [];
   let buf = "";
 
   for (const p of paras) {
-    const candidate = buf ? buf + "\\n\\n" + p : p;
+    const candidate = buf ? buf + "\n\n" + p : p;
     if (candidate.length <= maxChars) {
       buf = candidate;
     } else {
@@ -161,6 +164,9 @@ app.get('/health', (_req, res) => {
     auth: tokenFingerprint(API_TOKEN)
   });
 });
+
+// Quick version probe
+app.get('/version', (_req, res) => res.json({ build: APP_BUILD }));
 
 // ---------- DEFAULT PROJECT CONTROLS ----------
 app.post('/set-default-project', requireAuth, async (req, res) => {
@@ -228,11 +234,11 @@ app.post('/ask', async (req, res) => {
 
     const pid = await resolveProjectId(project_id, project_name || undefined)
     const ctx = await retrieveTopK(pid, question, 8)
-    const contextBlock = ctx.map((r, i) => `[${i + 1}] ${r.chunk_text}`).join('\\n\\n')
+    const contextBlock = ctx.map((r, i) => `[${i + 1}] ${r.chunk_text}`).join('\n\n')
 
     const projLabel = project_name || defaultProjectName || DEFAULT_PROJECT_NAME || 'My Project'
-    const isMuseOnly = /\\[Muse Only\\]/i.test(question)
-    const isEditorOnly = /\\[Editor Only\\]/i.test(question)
+    const isMuseOnly = /\[Muse Only\]/i.test(question)
+    const isEditorOnly = /\[Editor Only\]/i.test(question)
 
     let lyraPrompt = `
 You are **Lyra**, James’s creative muse **and** critical editor for the project "${projLabel}".
@@ -257,20 +263,20 @@ Answer format (always):
     if (isMuseOnly) {
       lyraPrompt = lyraPrompt.replace(
         "Answer format (always):",
-        "Answer format (Muse Only):\\n**Creative Insight:** …"
+        "Answer format (Muse Only):\n**Creative Insight:** …"
       )
     }
     if (isEditorOnly) {
       lyraPrompt = lyraPrompt.replace(
         "Answer format (always):",
-        "Answer format (Editor Only):\\n**Critical Feedback:** …"
+        "Answer format (Editor Only):\n**Critical Feedback:** …"
       )
     }
 
     const messages = [
       { role: 'system', content: lyraPrompt },
       ...history,
-      { role: 'user', content: `Context:\\n${contextBlock}\\n\\nQuestion: ${question}` }
+      { role: 'user', content: `Context:\n${contextBlock}\n\nQuestion: ${question}` }
     ]
 
     const resp = await openai.chat.completions.create({
@@ -293,7 +299,7 @@ app.post('/ask-stream', async (req, res) => {
 
     const pid = await resolveProjectId(project_id, project_name || undefined)
     const ctx = await retrieveTopK(pid, question, 8)
-    const contextBlock = ctx.map((r,i)=>`[${i+1}] ${r.chunk_text}`).join('\\n\\n')
+    const contextBlock = ctx.map((r,i)=>`[${i+1}] ${r.chunk_text}`).join('\n\n')
 
     res.writeHead(200, {
       'Content-Type':'text/event-stream',
@@ -303,8 +309,8 @@ app.post('/ask-stream', async (req, res) => {
     })
 
     const projLabel = project_name || defaultProjectName || DEFAULT_PROJECT_NAME || 'My Project'
-    const isMuseOnly = /\\[Muse Only\\]/i.test(question)
-    const isEditorOnly = /\\[Editor Only\\]/i.test(question)
+    const isMuseOnly = /\[Muse Only\]/i.test(question)
+    const isEditorOnly = /\[Editor Only\]/i.test(question)
 
     let lyraPrompt = `
 You are **Lyra**, James’s creative muse **and** critical editor for the project "${projLabel}".
@@ -329,20 +335,20 @@ Answer format (always):
     if (isMuseOnly) {
       lyraPrompt = lyraPrompt.replace(
         "Answer format (always):",
-        "Answer format (Muse Only):\\n**Creative Insight:** …"
+        "Answer format (Muse Only):\n**Creative Insight:** …"
       )
     }
     if (isEditorOnly) {
       lyraPrompt = lyraPrompt.replace(
         "Answer format (always):",
-        "Answer format (Editor Only):\\n**Critical Feedback:** …"
+        "Answer format (Editor Only):\n**Critical Feedback:** …"
       )
     }
 
     const messages = [
       { role:'system', content: lyraPrompt },
       ...history,
-      { role:'user', content:`Context:\\n${contextBlock}\\n\\nQuestion: ${question}` }
+      { role:'user', content:`Context:\n${contextBlock}\n\nQuestion: ${question}` }
     ]
 
     const stream = await openai.chat.completions.create({
@@ -352,12 +358,12 @@ Answer format (always):
 
     for await (const chunk of stream) {
       const delta = chunk?.choices?.[0]?.delta?.content || ''
-      if (delta) res.write(`data:${JSON.stringify({ delta })}\\n\\n`)
+      if (delta) res.write(`data:${JSON.stringify({ delta })}\n\n`)
     }
-    res.write(`data:${JSON.stringify({ done:true, used_context: ctx })}\\n\\n`)
+    res.write(`data:${JSON.stringify({ done:true, used_context: ctx })}\n\n`)
     res.end()
   } catch (e) {
-    res.write(`data:${JSON.stringify({ error:String(e.message || e) })}\\n\\n`)
+    res.write(`data:${JSON.stringify({ error:String(e.message || e) })}\n\n`)
     res.end()
   }
 })
@@ -380,7 +386,7 @@ app.post('/ingest', requireAuth, async (req, res) => {
     const { rows } = await pool.query(insertDocSQL, [pid, doc_type, title, body_md, tags, JSON.stringify(metaObj)]);
     const doc_id = rows[0].id;
 
-    const paragraphs = body_md.split(/\\n\\s*\\n/).map(s => s.trim()).filter(Boolean);
+    const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
     const chunks = paragraphs.length ? paragraphs : [body_md];
 
     for (let i = 0; i < chunks.length; i += 16) {
@@ -408,7 +414,7 @@ app.post('/ingest', requireAuth, async (req, res) => {
 // Save/append one chunk directly
 app.post('/scenes/upsert', requireAuth, async (req, res) => {
   try {
-    const { project, chapterId, sceneId, content, mode = 'overwrite', api_token } = req.body || {};
+    const { project, chapterId, sceneId, content, mode = 'overwrite' } = req.body || {};
     if (!project || !chapterId || !sceneId) {
       return res.status(400).json({ error: 'project, chapterId, sceneId required' })
     }
@@ -423,7 +429,7 @@ app.post('/scenes/upsert', requireAuth, async (req, res) => {
         [project, chapterId, sceneId]
       );
       const prev = rows[0]?.content || ""
-      finalContent = prev ? `${prev}\\n\\n${content}` : content
+      finalContent = prev ? `${prev}\n\n${content}` : content
     }
 
     await pool.query(
@@ -474,7 +480,7 @@ app.post('/scenes/paste', async (req, res) => {
           [project, chapterId, sceneId]
         );
         const prev = rows[0]?.content || ""
-        finalContent = prev ? `${prev}\\n\\n${chunks[i]}` : chunks[i]
+        finalContent = prev ? `${prev}\n\n${chunks[i]}` : chunks[i]
       }
 
       await pool.query(
@@ -576,45 +582,163 @@ app.delete('/scenes/delete', requireAuth, async (req, res) => {
   }
 })
 
-// Paste + immediate Lyra critique
-app.post('/scenes/paste-and-critique', async (req, res) => {
+// ---------- DOC UPSERT & EMBEDDING HELPERS ----------
+async function upsertDocumentByTitle({ projectId, title, body_md, doc_type='scene', tags=[], meta={}, docMode='upsert' }) {
+  // docMode: 'upsert' | 'create' | 'update'
+  const found = await pool.query(
+    `SELECT id FROM documents WHERE project_id = $1 AND title = $2 ORDER BY updated_at DESC LIMIT 1`,
+    [projectId, title]
+  );
+  let document_id;
+  if (found.rows.length) {
+    if (docMode === 'create') throw new Error('Document exists; docMode=create prevented overwrite');
+    document_id = found.rows[0].id;
+    const sets = ['updated_at = now()', 'body_md = $1', 'tags = $2', 'meta = $3::jsonb'];
+    await pool.query(
+      `UPDATE documents SET ${sets.join(', ')} WHERE id = $4`,
+      [body_md, tags, JSON.stringify(meta), document_id]
+    );
+    await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id]);
+  } else {
+    if (docMode === 'update') throw new Error('Document not found; docMode=update prevented create');
+    const ins = await pool.query(
+      `INSERT INTO documents (project_id, doc_type, title, body_md, tags, meta, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6, now(), now())
+       RETURNING id`,
+      [projectId, doc_type, title, body_md, tags, JSON.stringify(meta)]
+    );
+    document_id = ins.rows[0].id;
+  }
+
+  // Embed (paragraph chunks)
+  const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+  const chunks = paragraphs.length ? paragraphs : [body_md];
+
+  for (let i = 0; i < chunks.length; i += 16) {
+    const batch = chunks.slice(i, i + 16);
+    const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch });
+    for (let j = 0; j < batch.length; j++) {
+      const vecStr = `[${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]`;
+      const embMeta = { title, doc_type, ...meta };
+      await pool.query(
+        `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
+         VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
+        [projectId, document_id, i + j + 1, batch[j], vecStr, JSON.stringify(embMeta)]
+      );
+    }
+  }
+  return document_id;
+}
+
+// ---------- LYRA: PASTE → SAVE (scenes + document) → CRITIQUE ----------
+// Added mode flags:
+//   sceneWriteMode: 'overwrite' | 'append' | 'auto'   (default 'auto': split; first chunk overwrites, rest append)
+//   docMode:        'upsert' | 'create' | 'update'    (default 'upsert')
+app.post('/lyra/paste-save', requireAuth, async (req, res) => {
   try {
-    const { project, chapterId, sceneId, content, maxChunk = 12000, mode = 'both' } = req.body || {}
-    if (!project || !chapterId || !sceneId) {
-      return res.status(400).json({ error: 'project, chapterId, and sceneId are required' })
-    }
-    if (typeof content !== 'string' || !content.trim()) {
-      return res.status(400).json({ error: 'content must be a non-empty string' })
-    }
-    if (content.length > 1_000_000) {
-      return res.status(413).json({ error: 'content too large (>1MB). Consider splitting logically.' })
+    const {
+      project_id,
+      project_name,
+      chapterId,
+      sceneId,
+      title,        // document title for RAG (required to upsert)
+      content,      // full scene text
+      tags = [],
+      meta = {},
+      maxChunk = 12000,
+      doc_type = 'scene',
+      critique = 'both',  // 'both' | 'muse-only' | 'editor-only'
+      saveToScenes = true,
+      saveToDocuments = true,
+      sceneWriteMode = 'auto', // 'overwrite' | 'append' | 'auto'
+      docMode = 'upsert'       // 'upsert' | 'create' | 'update'
+    } = req.body || {};
+
+    if (!content || !title) {
+      return res.status(400).json({ error: 'title and content are required' });
     }
 
-    const chunks = chunkText(content, Number(maxChunk) || 12000)
-    for (let i = 0; i < chunks.length; i++) {
-      const writeMode = i === 0 ? 'overwrite' : 'append'
-      let finalContent = chunks[i]
-      if (writeMode === 'append') {
+    const pid = await resolveProjectId(project_id, project_name);
+
+    // 1) Save into scenes table (optional)
+    let sceneWrite = null;
+    if (saveToScenes) {
+      if (!chapterId || !sceneId) {
+        return res.status(400).json({ error: 'chapterId and sceneId required when saveToScenes is true' });
+      }
+
+      const modeNorm = String(sceneWriteMode || 'auto').toLowerCase();
+      if (modeNorm === 'overwrite') {
+        await pool.query(
+          `INSERT INTO scenes (project, chapter_id, scene_id, content, updated_at)
+           VALUES ($1,$2,$3,$4, now())
+           ON CONFLICT (project, chapter_id, scene_id)
+           DO UPDATE SET content = EXCLUDED.content, updated_at = now()`,
+          [project_name || project_id, chapterId, sceneId, content]
+        );
+      } else if (modeNorm === 'append') {
         const { rows } = await pool.query(
           `SELECT content FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
-          [project, chapterId, sceneId]
+          [project_name || project_id, chapterId, sceneId]
         );
-        const prev = rows[0]?.content || ""
-        finalContent = prev ? `${prev}\\n\\n${chunks[i]}` : chunks[i]
+        const prev = rows[0]?.content || "";
+        const finalContent = prev ? `${prev}\n\n${content}` : content;
+        await pool.query(
+          `INSERT INTO scenes (project, chapter_id, scene_id, content, updated_at)
+           VALUES ($1,$2,$3,$4, now())
+           ON CONFLICT (project, chapter_id, scene_id)
+           DO UPDATE SET content = EXCLUDED.content, updated_at = now()`,
+          [project_name || project_id, chapterId, sceneId, finalContent]
+        );
+      } else {
+        // 'auto' → split into chunks and write overwrite+append sequence
+        const chunks = chunkText(content, Number(maxChunk) || 12000);
+        for (let i = 0; i < chunks.length; i++) {
+          const isAppend = i > 0;
+          let finalContent = chunks[i];
+          if (isAppend) {
+            const { rows } = await pool.query(
+              `SELECT content FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
+              [project_name || project_id, chapterId, sceneId]
+            );
+            const prev = rows[0]?.content || "";
+            finalContent = prev ? `${prev}\n\n${chunks[i]}` : chunks[i];
+          }
+
+          await pool.query(
+            `INSERT INTO scenes (project, chapter_id, scene_id, content, updated_at)
+             VALUES ($1,$2,$3,$4, now())
+             ON CONFLICT (project, chapter_id, scene_id)
+             DO UPDATE SET content = EXCLUDED.content, updated_at = now()`,
+            [project_name || project_id, chapterId, sceneId, finalContent]
+          );
+        }
       }
-      await pool.query(
-        `INSERT INTO scenes (project, chapter_id, scene_id, content, updated_at)
-         VALUES ($1,$2,$3,$4, now())
-         ON CONFLICT (project, chapter_id, scene_id)
-         DO UPDATE SET content = EXCLUDED.content, updated_at = now()`,
-        [project, chapterId, sceneId, finalContent]
-      )
+
+      const { rows: R } = await pool.query(
+        `SELECT length(content) AS len FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
+        [project_name || project_id, chapterId, sceneId]
+      );
+      sceneWrite = { ok: true, project: project_name || project_id, chapterId, sceneId, length: Number(R[0].len), sceneWriteMode: modeNorm };
     }
 
-    const isMuseOnly = /muse-only|^\\[muse only\\]/i.test(mode)
-    const isEditorOnly = /editor-only|^\\[editor only\\]/i.test(mode)
+    // 2) Upsert into documents + embeddings (optional)
+    let document_id = null;
+    if (saveToDocuments) {
+      const metaFull = { ...meta };
+      if (chapterId) metaFull.chapter = metaFull.chapter ?? chapterId;
+      if (sceneId) metaFull.scene = metaFull.scene ?? sceneId;
+      document_id = await upsertDocumentByTitle({
+        projectId: pid, title, body_md: content, doc_type, tags, meta: metaFull, docMode
+      });
+    }
+
+    // 3) Lyra critique
+    const isMuseOnly = /muse-only/i.test(critique);
+    const isEditorOnly = /editor-only/i.test(critique);
+
     let lyraPrompt = `
-You are **Lyra**, James’s creative muse **and** critical editor for the project "${project}".
+You are **Lyra**, James’s creative muse **and** critical editor for the project "${project_name || 'Untitled'}".
 
 Every response must include two labeled parts:
 
@@ -631,42 +755,46 @@ Guardrails:
 Answer format (always):
 **Creative Insight:** …
 **Critical Feedback:** …
-    `.trim()
+    `.trim();
 
     if (isMuseOnly) {
       lyraPrompt = lyraPrompt.replace(
         "Answer format (always):",
-        "Answer format (Muse Only):\\n**Creative Insight:** …"
-      )
+        "Answer format (Muse Only):\n**Creative Insight:** …"
+      );
     }
     if (isEditorOnly) {
       lyraPrompt = lyraPrompt.replace(
         "Answer format (always):",
-        "Answer format (Editor Only):\\n**Critical Feedback:** …"
-      )
+        "Answer format (Editor Only):\n**Critical Feedback:** …"
+      );
     }
 
     const messages = [
       { role: 'system', content: lyraPrompt },
-      { role: 'user', content: `Context:\\n${content}\\n\\nQuestion: Review this scene.` }
-    ]
+      { role: 'user', content: `Context:\n${content}\n\nQuestion: Review this scene and suggest targeted improvements.` }
+    ];
 
     const gpt = await openai.chat.completions.create({
       model: MODEL_CHAT,
       messages,
       temperature: 0.7
-    })
+    });
 
     res.json({
       ok: true,
-      saved: { project, chapterId, sceneId, chunks: chunks.length },
+      build: APP_BUILD,
+      saved: {
+        scene: sceneWrite,
+        document_id
+      },
       critique: gpt.choices?.[0]?.message?.content || ''
-    })
-  } catch (err) {
-    console.error('paste-and-critique error', err)
-    res.status(500).json({ error: 'internal_error', detail: String(err?.message || err) })
+    });
+  } catch (e) {
+    console.error('lyra/paste-save error', e);
+    res.status(500).json({ error: 'internal_error', detail: String(e?.message || e) });
   }
-})
+});
 
 // ---------- UPDATE / RE-EMBED ----------
 app.post('/update', requireAuth, async (req, res) => {
@@ -707,7 +835,7 @@ app.post('/update', requireAuth, async (req, res) => {
       const embDocType = current.doc_type || 'update';
       const embMetaBase = coerceMeta(meta ?? current.meta);
 
-      const paragraphs = body_md.split(/\\n\\s*\\n/).map(s => s.trim()).filter(Boolean);
+      const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
       const chunks = paragraphs.length ? paragraphs : [body_md];
 
       for (let i = 0; i < chunks.length; i += 16) {
@@ -776,7 +904,7 @@ app.post('/update-by-title', requireAuth, async (req, res) => {
       const embDocType = current.doc_type || 'update';
       const embMetaBase = coerceMeta(meta ?? current.meta);
 
-      const paragraphs = body_md.split(/\\n\\s*\\n/).map(s => s.trim()).filter(Boolean);
+      const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
       const chunks = paragraphs.length ? paragraphs : [body_md];
 
       for (let i = 0; i < chunks.length; i += 16) {
@@ -876,12 +1004,55 @@ app.get('/openapi.json', (_req, res) => {
   "openapi": "3.1.0",
   "info": {
     "title": "Writer Brain API",
-    "version": "1.4.7"
+    "version": "1.5.0"
   },
   "servers": [
     { "url": "https://writer-api-p0c7.onrender.com" }
   ],
   "paths": {
+    "/lyra/paste-save": {
+      "post": {
+        "operationId": "lyraPasteSave",
+        "summary": "Paste full scene → save to scenes (mode) + upsert document (mode) → return Lyra critique",
+        "security": [ { "bearerAuth": [] } ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "project_id":   { "type": "string" },
+                  "project_name": { "type": "string" },
+                  "chapterId":    { "type": "string" },
+                  "sceneId":      { "type": "string" },
+                  "title":        { "type": "string" },
+                  "content":      { "type": "string" },
+                  "tags":         { "type": "array", "items": { "type": "string" } },
+                  "meta":         { "type": "object", "additionalProperties": true },
+                  "maxChunk":     { "type": "integer", "default": 12000 },
+                  "doc_type":     { "type": "string", "default": "scene" },
+                  "critique":     { "type": "string", "enum": ["both","muse-only","editor-only"], "default": "both" },
+                  "saveToScenes":    { "type": "boolean", "default": true },
+                  "saveToDocuments": { "type": "boolean", "default": true },
+                  "sceneWriteMode":  { "type": "string", "enum": ["overwrite","append","auto"], "default": "auto" },
+                  "docMode":         { "type": "string", "enum": ["upsert","create","update"], "default": "upsert" }
+                },
+                "required": ["title","content"],
+                "oneOf": [
+                  { "required": ["project_id"] },
+                  { "required": ["project_name"] }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Saved + critique" }
+        }
+      }
+    },
+
     "/ask": {
       "post": {
         "operationId": "askProject",

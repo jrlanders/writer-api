@@ -61,7 +61,7 @@ const pool = new Pool({ connectionString: DB_URL, ssl: { rejectUnauthorized: fal
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY })
 
 // Build tag / health
-const APP_BUILD = '2025-08-31-1.6.0-archive-redirect'
+const APP_BUILD = '2025-08-30-1.5.0-lyra-paste-modes'
 
 // Attach build header for easy verification
 app.use((req,res,next) => { res.setHeader('X-App-Build', APP_BUILD); next(); });
@@ -233,14 +233,7 @@ app.post('/ask', async (req, res) => {
     if (!question) return res.status(400).json({ error: 'question required' })
 
     const pid = await resolveProjectId(project_id, project_name || undefined)
-    let ctx = await retrieveTopK(pid, question, 8)
-    // Skip archived docs by default if meta.lifecycle.status === 'archived'
-    const includeArchived = /\[include_archived\]/i.test(question)
-    if (!includeArchived) {
-      ctx = ctx.filter(r => {
-        try { const m = coerceMeta(r.meta); return !(m?.lifecycle && m.lifecycle.status === 'archived'); } catch { return true; }
-      })
-    }
+    const ctx = await retrieveTopK(pid, question, 8)
     const contextBlock = ctx.map((r, i) => `[${i + 1}] ${r.chunk_text}`).join('\n\n')
 
     const projLabel = project_name || defaultProjectName || DEFAULT_PROJECT_NAME || 'My Project'
@@ -305,13 +298,7 @@ app.post('/ask-stream', async (req, res) => {
     if (!question) return res.status(400).json({ error: 'question required' })
 
     const pid = await resolveProjectId(project_id, project_name || undefined)
-    let ctx = await retrieveTopK(pid, question, 8)
-    const includeArchived = /\[include_archived\]/i.test(question)
-    if (!includeArchived) {
-      ctx = ctx.filter(r => {
-        try { const m = coerceMeta(r.meta); return !(m?.lifecycle && m.lifecycle.status === 'archived'); } catch { return true; }
-      })
-    }
+    const ctx = await retrieveTopK(pid, question, 8)
     const contextBlock = ctx.map((r,i)=>`[${i+1}] ${r.chunk_text}`).join('\n\n')
 
     res.writeHead(200, {
@@ -1010,6 +997,8 @@ app.get('/doc-by-title', async (req, res) => {
   }
 })
 
+// ---------- OpenAPI 3.1.0 for GPT Actions ----------
+
 // ---------- ARCHIVE & REDIRECT (soft-delete via meta) ----------
 
 // Title normalizer (lowercase + collapse whitespace)
@@ -1017,7 +1006,7 @@ function normalizeTitle(t) {
   return (t || "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-// Merge two shallow objects (right wins), ignoring null/undefined gracefully
+// Simple merge for plain objects (right wins)
 function mergeShallow(a = {}, b = {}) {
   const out = { ...(a || {}) };
   for (const k of Object.keys(b || {})) {
@@ -1027,7 +1016,26 @@ function mergeShallow(a = {}, b = {}) {
   return out;
 }
 
-// Get all docs in a project that match a title (case-insensitive) and doc_type
+// Ensure unique strings
+function uniq(arr = []) {
+  return Array.from(new Set((arr || []).filter(Boolean)));
+}
+
+// Map db row to doc object
+function rowToDoc(r) {
+  return {
+    doc_id: r.id,
+    project_id: r.project_id,
+    title: r.title,
+    doc_type: r.doc_type,
+    body_md: r.body_md,
+    tags: Array.isArray(r.tags) ? r.tags : [],
+    meta: coerceMeta(r.meta),
+    updated_at: r.updated_at
+  };
+}
+
+// List docs by exact (case-insensitive) title + type for a project
 async function listDocsByTitleAndTypePg(projectId, title, doc_type) {
   const { rows } = await pool.query(
     `SELECT id, project_id, title, doc_type, body_md, tags, meta, updated_at
@@ -1038,19 +1046,9 @@ async function listDocsByTitleAndTypePg(projectId, title, doc_type) {
       ORDER BY updated_at DESC`,
     [projectId, doc_type, title]
   );
-  return rows.map(r => ({
-    doc_id: r.id,
-    project_id: r.project_id,
-    title: r.title,
-    doc_type: r.doc_type,
-    body_md: r.body_md,
-    tags: Array.isArray(r.tags) ? r.tags : [],
-    meta: coerceMeta(r.meta),
-    updated_at: r.updated_at
-  }));
+  return rows.map(rowToDoc);
 }
 
-// Pick canonical doc among a list (default: newest by updated_at)
 function pickCanonical(docs, strategy = "newest", explicitId = null) {
   if (!Array.isArray(docs) || docs.length === 0) return null;
   if (explicitId) {
@@ -1058,51 +1056,40 @@ function pickCanonical(docs, strategy = "newest", explicitId = null) {
     if (x) return x;
   }
   if (strategy === "oldest") {
-    return docs.slice().sort((a,b) => new Date(a.updated_at) - new Date(b.updated_at))[0];
+    return docs.slice().sort((a,b)=> new Date(a.updated_at) - new Date(b.updated_at))[0];
   }
-  // newest by default
-  return docs.slice().sort((a,b) => new Date(b.updated_at) - new Date(a.updated_at))[0];
+  return docs.slice().sort((a,b)=> new Date(b.updated_at) - new Date(a.updated_at))[0];
 }
 
-// Ensure unique simple string arrays
-function uniq(arr = []) {
-  return Array.from(new Set((arr || []).filter(Boolean)));
-}
-
-// Prepend a banner to an MD body (non-destructive)
 function prependBanner(md, canonicalId) {
   const banner = `> ⚠️ Archived duplicate. See canonical: ${canonicalId}.\n\n`;
   return banner + (md || "");
 }
 
-// Update a single document's body/tags/meta (re-embed if body provided) leveraging existing /update logic
+// Direct document update (without extra HTTP hop); re-embeds if body changes
 async function _updateDocDirect({ project_id, document_id, title, body_md, tags, meta }) {
-  // Reuse the logic of /update but inline to avoid an HTTP roundtrip
   const sets = [];
   const vals = [];
   let idx = 1;
 
-  if (title)   { sets.push(`title = $${idx++}`);        vals.push(title); }
-  if (body_md) { sets.push(`body_md = $${idx++}`);      vals.push(body_md); }
-  if (tags)    { sets.push(`tags = $${idx++}`);         vals.push(tags); }
-  if (meta)    { sets.push(`meta = $${idx++}::jsonb`);  vals.push(JSON.stringify(coerceMeta(meta))); }
+  if (title)   { sets.push(\`title = $\${idx++}\`);        vals.push(title); }
+  if (body_md) { sets.push(\`body_md = $\${idx++}\`);      vals.push(body_md); }
+  if (tags)    { sets.push(\`tags = $\${idx++}\`);         vals.push(tags); }
+  if (meta)    { sets.push(\`meta = $\${idx++}::jsonb\`);  vals.push(JSON.stringify(coerceMeta(meta))); }
 
-  sets.push(`updated_at = now()`);
+  sets.push(\`updated_at = now()\`);
   vals.push(project_id, document_id);
 
   const { rowCount } = await pool.query(
-    `UPDATE documents SET ${sets.join(', ')} WHERE project_id = $${idx++} AND id = $${idx}`,
+    \`UPDATE documents SET $\{sets.join(', ')} WHERE project_id = $\${idx++} AND id = $\${idx}\`,
     vals
   );
   if (rowCount === 0) throw new Error('Document not found for this project');
 
   if (body_md) {
-    await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id]);
+    await pool.query(\`DELETE FROM embeddings WHERE document_id = $1\`, [document_id]);
 
-    const docQ = await pool.query(
-      `SELECT title, doc_type, meta FROM documents WHERE id = $1`,
-      [document_id]
-    );
+    const docQ = await pool.query(\`SELECT title, doc_type, meta FROM documents WHERE id = $1\`, [document_id]);
     const current = docQ.rows[0] || {};
     const embTitle = title ?? current.title ?? '(updated)';
     const embDocType = current.doc_type || 'update';
@@ -1115,11 +1102,11 @@ async function _updateDocDirect({ project_id, document_id, title, body_md, tags,
       const batch = chunks.slice(i, i + 16);
       const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch });
       for (let j = 0; j < batch.length; j++) {
-        const vecStr = `[${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]`;
+        const vecStr = \`[\${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]\`;
         const embMeta = { title: embTitle, doc_type: embDocType, ...embMetaBase };
         await pool.query(
-          `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
-           VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
+          \`INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
+           VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)\`,
           [project_id, document_id, i + j + 1, batch[j], vecStr, JSON.stringify(embMeta)]
         );
       }
@@ -1127,7 +1114,7 @@ async function _updateDocDirect({ project_id, document_id, title, body_md, tags,
   }
 }
 
-// Route: Archive duplicates and redirect to canonical (soft-delete into meta)
+// Archive duplicates and redirect to canonical
 app.post('/archive-redirect', requireAuth, async (req, res) => {
   try {
     const {
@@ -1138,11 +1125,9 @@ app.post('/archive-redirect', requireAuth, async (req, res) => {
       add_banner = false
     } = req.body || {};
 
-    if (!title || !doc_type) {
-      return res.status(400).json({ error: 'title and doc_type are required' });
-    }
+    if (!title || !doc_type) return res.status(400).json({ error: 'title and doc_type are required' });
 
-    const pid = await resolveProjectId(project_id, project_name);
+    const pid = await resolveProjectId(project_id, project_name || undefined);
     const docs = await listDocsByTitleAndTypePg(pid, title, doc_type);
     if (!docs.length) return res.json({ ok: true, message: 'No matching documents' });
     if (docs.length === 1) return res.json({ ok: true, message: 'Only one doc; nothing to archive', canonical: { id: docs[0].doc_id, title: docs[0].title } });
@@ -1150,7 +1135,7 @@ app.post('/archive-redirect', requireAuth, async (req, res) => {
     const canonical = pickCanonical(docs, strategy, canonical_doc_id);
     const dupes = docs.filter(d => d.doc_id !== canonical.doc_id);
 
-    // 1) Update canonical aliases in meta (store aliases list in meta.aliases for portability)
+    // 1) Add aliases to canonical meta
     const aliasTitles = uniq(dupes.map(d => d.title));
     const canonMeta = coerceMeta(canonical.meta);
     const newAliases = uniq([...(canonMeta.aliases || []), ...aliasTitles]);
@@ -1163,7 +1148,7 @@ app.post('/archive-redirect', requireAuth, async (req, res) => {
       tags: canonTags
     });
 
-    // 2) Archive each duplicate by setting meta.lifecycle.status = 'archived' and meta.superseded_by
+    // 2) Archive each duplicate
     const archived = [];
     for (const dupe of dupes) {
       const dmeta = coerceMeta(dupe.meta);
@@ -1194,24 +1179,22 @@ app.post('/archive-redirect', requireAuth, async (req, res) => {
   }
 });
 
-// Route: Update/merge canonical body then archive+redirect dupes
+// Update/append canonical body_md then archive & redirect duplicates
 app.post('/update-and-archive', requireAuth, async (req, res) => {
   try {
     const {
       project_id, project_name,
       title, doc_type,
       update_body_md = null,
-      merge_strategy = 'append',        // 'replace' | 'append'
+      merge_strategy = 'append',  // 'replace' | 'append'
       canonical_doc_id = null,
       strategy = 'newest',
       add_banner = false
     } = req.body || {};
 
-    if (!title || !doc_type) {
-      return res.status(400).json({ error: 'title and doc_type are required' });
-    }
+    if (!title || !doc_type) return res.status(400).json({ error: 'title and doc_type are required' });
 
-    const pid = await resolveProjectId(project_id, project_name);
+    const pid = await resolveProjectId(project_id, project_name || undefined);
     const docs = await listDocsByTitleAndTypePg(pid, title, doc_type);
     if (!docs.length) return res.status(404).json({ error: 'No matching documents' });
 
@@ -1222,7 +1205,7 @@ app.post('/update-and-archive', requireAuth, async (req, res) => {
     if (typeof update_body_md === 'string') {
       let newBody = canonical.body_md || '';
       if (merge_strategy === 'replace') newBody = update_body_md;
-      else newBody = (canonical.body_md || '') + (newBody && update_body_md ? '\n\n' : '') + update_body_md; // append default
+      else newBody = (canonical.body_md || '') + (newBody && update_body_md ? '\n\n' : '') + update_body_md;
 
       const canonMeta = coerceMeta(canonical.meta);
       const canonTags = uniq([...(canonical.tags || []), 'deduped','canonical','merged']);
@@ -1236,9 +1219,9 @@ app.post('/update-and-archive', requireAuth, async (req, res) => {
       });
     }
 
-    // 2) Add aliases from dupes to canonical meta
+    // 2) Add aliases from dupes
     const aliasTitles = uniq(dupes.map(d => d.title));
-    const afterCanon = await pool.query(`SELECT meta, tags FROM documents WHERE id = $1`, [canonical.doc_id]);
+    const afterCanon = await pool.query('SELECT meta, tags FROM documents WHERE id = $1', [canonical.doc_id]);
     const curMeta = coerceMeta(afterCanon.rows?.[0]?.meta);
     const curAliases = uniq([...(curMeta.aliases || []), ...aliasTitles]);
     const curTags = uniq([...(afterCanon.rows?.[0]?.tags || []), 'deduped','canonical']);
@@ -1282,14 +1265,25 @@ app.post('/update-and-archive', requireAuth, async (req, res) => {
   }
 });
 
-// ---------- OpenAPI 3.1.0 for GPT Actions ----------
+// ----- Alias routes for camelCase callers (compat) -----
+app.post('/archiveRedirect', (req, res, next) => {
+  req.url = '/archive-redirect';
+  next();
+});
+
+app.post('/updateAndArchive', (req, res, next) => {
+  req.url = '/update-and-archive';
+  next();
+});
+
+
 app.get('/openapi.json', (_req, res) => {
   res.json(
   {
   "openapi": "3.1.0",
   "info": {
     "title": "Writer Brain API",
-    "version": "1.5.0"
+    "version": APP_BUILD
   },
   "servers": [
     { "url": "https://writer-api-p0c7.onrender.com" }
@@ -1588,11 +1582,73 @@ app.get('/openapi.json', (_req, res) => {
       }
     }
   },
-  "components": {
+ 
+  , "/archive-redirect": {
+      "post": {
+        "summary": "Archive duplicates and redirect to canonical",
+        "operationId": "archiveRedirect",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ArchiveRedirectRequest" }
+            }
+          }
+        },
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/update-and-archive": {
+      "post": {
+        "summary": "Update canonical then archive/redirect duplicates",
+        "operationId": "updateAndArchive",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/UpdateAndArchiveRequest" }
+            }
+          }
+        },
+        "responses": { "200": { "description": "OK" } }
+      }
+    }
+ "components": {
     "securitySchemes": {
       "bearerAuth": { "type": "http", "scheme": "bearer", "bearerFormat": "JWT" }
     },
-    "schemas": {}
+    "schemas": {
+    "ArchiveRedirectRequest": {
+      "type": "object",
+      "required": ["title", "doc_type"],
+      "properties": {
+        "project_id":      { "type": "string" },
+        "project_name":    { "type": "string" },
+        "title":           { "type": "string" },
+        "doc_type":        { "type": "string", "enum": ["scene","chapter","concept","character","artifact","location"] },
+        "canonical_doc_id":{ "type": "string" },
+        "strategy":        { "type": "string", "enum": ["newest","oldest","explicit"], "default": "newest" },
+        "add_banner":      { "type": "boolean", "default": false }
+      }
+    },
+    "UpdateAndArchiveRequest": {
+      "type": "object",
+      "required": ["title", "doc_type"],
+      "properties": {
+        "project_id":      { "type": "string" },
+        "project_name":    { "type": "string" },
+        "title":           { "type": "string" },
+        "doc_type":        { "type": "string", "enum": ["scene","chapter","concept","character","artifact","location"] },
+        "update_body_md":  { "type": "string" },
+        "merge_strategy":  { "type": "string", "enum": ["replace","append"], "default": "append" },
+        "canonical_doc_id":{ "type": "string" },
+        "strategy":        { "type": "string", "enum": ["newest","oldest","explicit"], "default": "newest" },
+        "add_banner":      { "type": "boolean", "default": false }
+      }
+    }
+}
   }
 })
 })

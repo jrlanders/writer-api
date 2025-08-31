@@ -1072,24 +1072,24 @@ async function _updateDocDirect({ project_id, document_id, title, body_md, tags,
   const vals = [];
   let idx = 1;
 
-  if (title)   { sets.push(\`title = $\${idx++}\`);        vals.push(title); }
-  if (body_md) { sets.push(\`body_md = $\${idx++}\`);      vals.push(body_md); }
-  if (tags)    { sets.push(\`tags = $\${idx++}\`);         vals.push(tags); }
-  if (meta)    { sets.push(\`meta = $\${idx++}::jsonb\`);  vals.push(JSON.stringify(coerceMeta(meta))); }
+  if (title)   { sets.push(`title = $\${idx++}`);        vals.push(title); }
+  if (body_md) { sets.push(`body_md = $\${idx++}`);      vals.push(body_md); }
+  if (tags)    { sets.push(`tags = $\${idx++}`);         vals.push(tags); }
+  if (meta)    { sets.push(`meta = $\${idx++}::jsonb`);  vals.push(JSON.stringify(coerceMeta(meta))); }
 
-  sets.push(\`updated_at = now()\`);
+  sets.push(`updated_at = now()`);
   vals.push(project_id, document_id);
 
   const { rowCount } = await pool.query(
-    \`UPDATE documents SET $\{sets.join(', ')} WHERE project_id = $\${idx++} AND id = $\${idx}\`,
+    `UPDATE documents SET ${sets.join(', ')} WHERE project_id = $\${idx++} AND id = $\${idx}`,
     vals
   );
   if (rowCount === 0) throw new Error('Document not found for this project');
 
   if (body_md) {
-    await pool.query(\`DELETE FROM embeddings WHERE document_id = $1\`, [document_id]);
+    await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id]);
 
-    const docQ = await pool.query(\`SELECT title, doc_type, meta FROM documents WHERE id = $1\`, [document_id]);
+    const docQ = await pool.query(`SELECT title, doc_type, meta FROM documents WHERE id = $1`, [document_id]);
     const current = docQ.rows[0] || {};
     const embTitle = title ?? current.title ?? '(updated)';
     const embDocType = current.doc_type || 'update';
@@ -1102,11 +1102,11 @@ async function _updateDocDirect({ project_id, document_id, title, body_md, tags,
       const batch = chunks.slice(i, i + 16);
       const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch });
       for (let j = 0; j < batch.length; j++) {
-        const vecStr = \`[\${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]\`;
+        const vecStr = `[\${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]`;
         const embMeta = { title: embTitle, doc_type: embDocType, ...embMetaBase };
         await pool.query(
-          \`INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
-           VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)\`,
+          `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
+           VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
           [project_id, document_id, i + j + 1, batch[j], vecStr, JSON.stringify(embMeta)]
         );
       }
@@ -1581,9 +1581,9 @@ app.get('/openapi.json', (_req, res) => {
         "responses": { "200": { "description": "Project id" } }
       }
     }
-  },
- 
-  , "/archive-redirect": {
+  ,
+
+    "/archive-redirect": {
       "post": {
         "summary": "Archive duplicates and redirect to canonical",
         "operationId": "archiveRedirect",
@@ -1599,6 +1599,7 @@ app.get('/openapi.json', (_req, res) => {
         "responses": { "200": { "description": "OK" } }
       }
     },
+
     "/update-and-archive": {
       "post": {
         "summary": "Update canonical then archive/redirect duplicates",
@@ -1615,6 +1616,9 @@ app.get('/openapi.json', (_req, res) => {
         "responses": { "200": { "description": "OK" } }
       }
     }
+},
+ 
+  
  "components": {
     "securitySchemes": {
       "bearerAuth": { "type": "http", "scheme": "bearer", "bearerFormat": "JWT" }

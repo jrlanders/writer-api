@@ -1,1760 +1,543 @@
-// server.js
-import 'dotenv/config'
-import express from 'express'
-import cors from 'cors'
-import { Pool } from 'pg'
-import OpenAI from 'openai'
-import crypto from 'crypto'
+/**
+ * server.js — Writing API — v2.3.0
+ * ---------------------------------------------------------------
+ * Additions over v2.2.0:
+ *   - Tag & meta filters for /doc and /lyra/read
+ *     * tag=<t> (repeatable) or tags=a,b,c
+ *     * tagsMode=all|any   (default: all)
+ *     * meta.<k>=<v> (repeatable) — all meta filters must match
+ */
 
-const app = express()
-// bigger limit so long scenes don’t 413
-app.use(express.json({ limit: '5mb' }))
-app.use(express.urlencoded({ extended: true, limit: '5mb' }))
-app.use(cors({ origin: ['http://localhost:3000', '*'] }))
+// 01. Imports & App Bootstrap
+// ---------------------------------------------------------------
+const express = require('express');
+const cors = require('cors');
+const { nanoid } = require('nanoid');
 
-// ====== 🔑 AUTH GUARD (set API_TOKEN in Render) ======
-const API_TOKEN = (process.env.API_TOKEN ?? '').trim();
+const app = express();
 
-function constantTimeEqual(a = '', b = '') {
-  if (a.length !== b.length) return false;
-  let out = 0;
-  for (let i = 0; i < a.length; i++) out |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return out === 0;
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(cors({ origin: ['http://localhost:3000', '*'] }));
+
+const PORT = process.env.PORT || 3000;
+const ALLOW_AUTOCONFIRM = process.env.ALLOW_AUTOCONFIRM === '1';
+
+// 02. In-Memory Data Layer
+// ---------------------------------------------------------------
+const db = {
+  projects: new Map(),
+  docs: new Map(),
+  trash: { projects: new Map(), docs: new Map() },
+};
+let DEFAULT_PROJECT_ID = null;
+
+// 03. Utilities & Helpers
+// ---------------------------------------------------------------
+const makeSlug = (s) => String(s || '').toLowerCase().trim().replace(/\s+/g, '-');
+
+// Title normalizer: lowercase, collapse internal whitespace, trim
+const normalizeTitle = (s) => String(s || '')
+  .toLowerCase()
+  .replace(/\s+/g, ' ')
+  .trim();
+
+const findProjectByName = (name) => {
+  if (!name) return null;
+  for (const p of db.projects.values()) if (p.name === name) return p;
+  return null;
+};
+const findProjectBySlug = (slug) => {
+  if (!slug) return null;
+  for (const p of db.projects.values()) if (p.slug === slug) return p;
+  return null;
+};
+
+// Soft-delete helpers
+function softDeleteProject(proj, who = 'system') {
+  if (!proj.deleted_at) {
+    proj.deleted_at = new Date().toISOString();
+    proj.deleted_by = who;
+  }
+  db.trash.projects.set(proj.id, { ...proj });
+}
+function softDeleteDoc(doc, who = 'system') {
+  if (!doc.deleted_at) {
+    doc.deleted_at = new Date().toISOString();
+    doc.deleted_by = who;
+  }
+  db.trash.docs.set(doc.id, { ...doc });
+}
+function purgeProject(id) {
+  db.trash.projects.delete(id);
+  db.projects.delete(id);
+}
+function purgeDoc(id) {
+  db.trash.docs.delete(id);
+  db.docs.delete(id);
 }
 
-// Accepts Authorization: Bearer <token>, x-api-token header, or ?api_token= query / body
-const requireAuth = (req, res, next) => {
-  if (!API_TOKEN) return next(); // allow all if not set (dev)
-
-  const auth = req.headers.authorization || req.headers.Authorization;
-  const headerRaw = (auth || '').trim();
-  const bearerPrefix = 'Bearer ';
-  const headerToken = headerRaw.startsWith(bearerPrefix) ? headerRaw.slice(bearerPrefix.length).trim() : '';
-
-  const xToken = (req.headers['x-api-token'] || '').toString().trim();
-  const qToken = (req.query.api_token || req.body?.api_token || '').toString().trim();
-
-  const presented = headerToken || xToken || qToken;
-
-  if (presented && constantTimeEqual(presented, API_TOKEN)) return next();
-
-  return res.status(401).json({ error: 'Unauthorized' });
-}
-// =====================================================
-
-// ENV
-const DB_URL = process.env.DB_URL
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY
-const MODEL_EMBED = process.env.MODEL_EMBED || 'text-embedding-3-small' // 1536-dim
-const MODEL_CHAT  = process.env.MODEL_CHAT  || 'gpt-4o'
-
-// Persistent default project (env fallback)
-const DEFAULT_PROJECT_ID   = process.env.DEFAULT_PROJECT_ID || null
-const DEFAULT_PROJECT_NAME = process.env.DEFAULT_PROJECT_NAME || null
-
-if (!DB_URL || !OPENAI_API_KEY) {
-  console.error('Missing DB_URL or OPENAI_API_KEY')
-  process.exit(1)
-}
-
-const pool = new Pool({ connectionString: DB_URL, ssl: { rejectUnauthorized: false } })
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY })
-
-// ===== Outline fields (synopsis, beats, scene_text) mapper =====
-function applyOutlineFields({ doc_type, incoming = {}, current = {} }) {
-  const out = { body_md: current.body_md, meta: coerceMeta(current.meta) };
-  const has = (k) => Object.prototype.hasOwnProperty.call(incoming, k);
-  if (has('beats') && incoming.beats != null) out.meta.beats = incoming.beats;
-  if (has('synopsis') && incoming.synopsis != null) {
-    out.meta.synopsis = incoming.synopsis;
-    if (doc_type !== 'scene' && (!out.body_md || String(out.body_md).trim() === '')) {
-      out.body_md = String(incoming.synopsis);
-    }
-  }
-  if (String(doc_type) === 'scene' && has('scene_text') && incoming.scene_text != null) {
-    out.body_md = String(incoming.scene_text);
-  }
-  return out;
-}
-
-// ===== Project freshness (10-minute timeout) =====
-const PROJECT_FRESH_MS = 10 * 60 * 1000;
-let lastConfirmedProject = { project_id: null, project_name: null, ts: 0 };
-
-async function getProjectNameById(project_id) {
-  if (!project_id) return null;
-  const { rows } = await pool.query(`SELECT name FROM projects WHERE id = $1`, [project_id]);
-  return rows[0]?.name || null;
-}
-
-function markProjectFresh(pid, pname) {
-  lastConfirmedProject = { project_id: pid || null, project_name: pname || null, ts: Date.now() };
-}
-
-function isProjectFresh(pid, pname) {
-  const same = (!!pid && lastConfirmedProject.project_id === pid) ||
-               (!!pname && lastConfirmedProject.project_name &&
-                 String(lastConfirmedProject.project_name).toLowerCase().trim() === String(pname).toLowerCase().trim());
-  if (!same) return false;
-  return (Date.now() - lastConfirmedProject.ts) < PROJECT_FRESH_MS;
-}
-
-async function enforceProjectFreshness(req, res, next) {
-  try {
-    const writePaths = new Set(['/ingest','/update','/update-by-title','/lyra/paste-save','/archive-redirect','/update-and-archive']);
-    if (!writePaths.has(req.path)) return next();
-    const pid = await resolveProjectId(req.body?.project_id, req.body?.project_name);
-    const pname = req.body?.project_name || (await getProjectNameById(pid));
-    if (isProjectFresh(pid, pname)) return next();
-    return res.status(409).json({
-      error: 'project_confirmation_required',
-      message: `Confirm project: ${pname}`,
-      project_id: pid,
-      project_name: pname,
-      confirm_with: { method: 'POST', path: '/confirm-project', body: { project_id: pid, project_name: pname } },
-      freshness_timeout_ms: PROJECT_FRESH_MS
-    });
-  } catch (e) {
-    console.error('enforceProjectFreshness error', e);
-    return res.status(500).json({ error: 'freshness_check_error', details: String(e?.message || e) });
-  }
-}
-
-app.post('/confirm-project', requireAuth, async (req, res) => {
-  try {
-    const { project_id, project_name } = req.body || {};
-    const pid = await resolveProjectId(project_id, project_name);
-    const pname = project_name || (await getProjectNameById(pid));
-    markProjectFresh(pid, pname);
-    res.json({ ok: true, project_id: pid, project_name: pname, confirmed_at: Date.now(), ttl_ms: PROJECT_FRESH_MS });
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
-  }
-});
-
-
-// Build tag / health
-const APP_BUILD = '2025-08-30-1.5.0-lyra-paste-modes'
-
-// Attach build header for easy verification
-app.use((req,res,next) => { res.setHeader('X-App-Build', APP_BUILD); next(); });
-
-// ---------- Session default project ----------
-let defaultProjectId = null
-let defaultProjectName = null
-
-function coerceMeta(m) {
-  return (m && typeof m === 'object' && !Array.isArray(m)) ? m : {};
-}
-
-// ---------- HELPERS ----------
-async function resolveProjectId(project_id, project_name) {
-  if (project_id) return project_id;
-  if (project_name) {
-    const { rows } = await pool.query(
-      `SELECT id FROM projects
-       WHERE trim(lower(name)) = trim(lower($1))`,
-      [project_name]
-    );
-    if (!rows.length) throw new Error(`Project not found: ${project_name}`);
-    return rows[0].id;
-  }
-  if (defaultProjectId) return defaultProjectId;
-  if (defaultProjectName) {
-    const { rows } = await pool.query(
-      `SELECT id FROM projects
-       WHERE trim(lower(name)) = trim(lower($1))`,
-      [defaultProjectName]
-    );
-    if (!rows.length) throw new Error(`Default project not found: ${defaultProjectName}`);
-    return rows[0].id;
-  }
-  throw new Error('Need project_id or project_name (no default set)');
-}
-
-async function retrieveTopK(projectId, query, k = 8) {
-  const emb = await openai.embeddings.create({ model: MODEL_EMBED, input: query })
-  const vec = emb.data[0].embedding
-  const vecStr = `[${vec.map(v => v.toFixed(8)).join(',')}]`
-  const { rows } = await pool.query(
-    `SELECT chunk_text, meta
-       FROM embeddings
-      WHERE project_id = $1
-      ORDER BY embedding <-> $2::vector
-      LIMIT $3`,
-    [projectId, vecStr, k]
-  )
-  return rows
-}
-
-// Split on paragraph boundaries, cap chunk size, and preserve order.
-function chunkText(text, maxChars = 12000) {
-  const paras = String(text || "").split(/\n\s*\n/g);
-  const chunks = [];
-  let buf = "";
-
-  for (const p of paras) {
-    const candidate = buf ? buf + "\n\n" + p : p;
-    if (candidate.length <= maxChars) {
-      buf = candidate;
-    } else {
-      if (buf) chunks.push(buf);
-      if (p.length > maxChars) {
-        for (let i = 0; i < p.length; i += maxChars) {
-          chunks.push(p.slice(i, i + maxChars));
-        }
-        buf = "";
-      } else {
-        buf = p;
-      }
-    }
-  }
-  if (buf) chunks.push(buf);
-  return chunks;
-}
-
-function tokenFingerprint(token) {
-  if (!token) return { set: false };
-  const hash = crypto.createHash('sha256').update(token).digest('hex');
-  return { set: true, sha256_8: hash.slice(0, 8), length: token.length };
-}
-
-// ---------- HEALTH ----------
-app.get('/health', (_req, res) => {
-  res.json({
-    ok: true,
-    build: APP_BUILD,
-    defaults: {
-      inMemory: { id: defaultProjectId, name: defaultProjectName },
-      env: { id: DEFAULT_PROJECT_ID, name: DEFAULT_PROJECT_NAME },
-      persona: {
-        id: "lyra",
-        name: "Lyra",
-        role: "Creative Muse + Critical Editor",
-        tone: "mythic, elegant, grounded; supportive but unsparing"
-      }
-    },
-    auth: tokenFingerprint(API_TOKEN)
-  });
-});
-
-// Quick version probe
-app.get('/version', (_req, res) => res.json({ build: APP_BUILD }));
-
-// ---------- DEFAULT PROJECT CONTROLS ----------
-app.post('/set-default-project', requireAuth, async (req, res) => {
-  try {
-    const { project_id, project_name } = req.body || {}
-    if (!project_id && !project_name) {
-      return res.status(400).json({ error: 'project_id or project_name required' })
-    }
-    if (project_id) {
-      defaultProjectId = project_id
-      defaultProjectName = null
-    } else {
-      const { rows } = await pool.query(`SELECT id FROM projects WHERE lower(name) = lower($1)`, [project_name])
-      if (!rows.length) return res.status(404).json({ error: `Project not found: ${project_name}` })
-      defaultProjectName = project_name
-      defaultProjectId = null
-    }
-    res.json({ ok: true, defaultProjectId, defaultProjectName })
-  } catch (e) {
-    res.status(500).json({ error: String(e) })
-  }
-})
-
-app.post('/clear-default-project', requireAuth, (_req, res) => {
-  defaultProjectId = null
-  defaultProjectName = null
-  res.json({ ok: true, message: 'Default project cleared' })
-})
-
-// ---------- PROJECTS ----------
-app.post('/project', requireAuth, async (req, res) => {
-  try {
-    const { name, description = null } = req.body || {}
-    if (!name) return res.status(400).json({ error: 'name required' })
-    const look = await pool.query(`SELECT id FROM projects WHERE lower(name) = lower($1)`, [name])
-    if (look.rows.length) return res.json({ project_id: look.rows[0].id, name })
-    const ins = await pool.query(
-      `INSERT INTO projects (name, description) VALUES ($1,$2) RETURNING id`,
-      [name, description]
-    )
-    res.json({ project_id: ins.rows[0].id, name })
-  } catch (e) {
-    res.status(500).json({ error: String(e) })
-  }
-})
-
-app.get('/projects', requireAuth, async (_req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, name, description, created_at
-         FROM projects
-        ORDER BY created_at DESC`
-    )
-    res.json({ items: rows })
-  } catch (e) {
-    res.status(500).json({ error: String(e) })
-  }
-})
-
-// ---------- READ: answer questions (Lyra + toggles) ----------
-app.post('/ask', async (req, res) => {
-  try {
-    const { question, project_id, project_name = null, history = [] } = req.body || {}
-    if (!question) return res.status(400).json({ error: 'question required' })
-
-    const pid = await resolveProjectId(project_id, project_name || undefined)
-    const ctx = await retrieveTopK(pid, question, 8)
-    const contextBlock = ctx.map((r, i) => `[${i + 1}] ${r.chunk_text}`).join('\n\n')
-
-    const projLabel = project_name || defaultProjectName || DEFAULT_PROJECT_NAME || 'My Project'
-    const isMuseOnly = /\[Muse Only\]/i.test(question)
-    const isEditorOnly = /\[Editor Only\]/i.test(question)
-
-    let lyraPrompt = `
-You are **Lyra**, James’s creative muse **and** critical editor for the project "${projLabel}".
-
-Every response must include two labeled parts:
-
-1) **Creative Insight** — imaginative expansion (themes, symbolism, worldbuilding, character beats, dialogue options, sensory detail, metaphor, title lines). Offer 2–4 concrete upgrades.
-
-2) **Critical Feedback** — honest, concise, actionable critique that raises the work toward bestseller quality. Focus on clarity of motivation, stakes, pacing, tension curve, POV control, redundancy, cliché risk, and market fit. Provide fixes, not just flags.
-
-Guardrails:
-- Never sugarcoat. If something’s weak, say why and show a better version.
-- Prefer specificity over generalities; cite exact lines/beat locations when possible.
-- Maintain James’s voice; suggest edits that preserve tone and intent.
-- If asked for outline/structure, ensure beats align with his Writing-from-the-Middle template.
-
-Answer format (always):
-**Creative Insight:** …
-**Critical Feedback:** …
-    `.trim()
-
-    if (isMuseOnly) {
-      lyraPrompt = lyraPrompt.replace(
-        "Answer format (always):",
-        "Answer format (Muse Only):\n**Creative Insight:** …"
-      )
-    }
-    if (isEditorOnly) {
-      lyraPrompt = lyraPrompt.replace(
-        "Answer format (always):",
-        "Answer format (Editor Only):\n**Critical Feedback:** …"
-      )
-    }
-
-    const messages = [
-      { role: 'system', content: lyraPrompt },
-      ...history,
-      { role: 'user', content: `Context:\n${contextBlock}\n\nQuestion: ${question}` }
-    ]
-
-    const resp = await openai.chat.completions.create({
-      model: MODEL_CHAT,
-      messages,
-      temperature: 0.7
-    })
-    res.json({ answer: resp.choices[0].message.content, used_context: ctx })
-  } catch (e) {
-    const code = e.statusCode || 500
-    res.status(code).json({ error: String(e.message || e) })
-  }
-})
-
-// ---------- READ (streaming): ChatGPT-style typing (Lyra + toggles) ----------
-app.post('/ask-stream', async (req, res) => {
-  try {
-    const { question, project_id, project_name = null, history = [] } = req.body || {}
-    if (!question) return res.status(400).json({ error: 'question required' })
-
-    const pid = await resolveProjectId(project_id, project_name || undefined)
-    const ctx = await retrieveTopK(pid, question, 8)
-    const contextBlock = ctx.map((r,i)=>`[${i+1}] ${r.chunk_text}`).join('\n\n')
-
-    res.writeHead(200, {
-      'Content-Type':'text/event-stream',
-      'Cache-Control':'no-cache',
-      'Connection':'keep-alive',
-      'Access-Control-Allow-Origin':'*'
-    })
-
-    const projLabel = project_name || defaultProjectName || DEFAULT_PROJECT_NAME || 'My Project'
-    const isMuseOnly = /\[Muse Only\]/i.test(question)
-    const isEditorOnly = /\[Editor Only\]/i.test(question)
-
-    let lyraPrompt = `
-You are **Lyra**, James’s creative muse **and** critical editor for the project "${projLabel}".
-
-Every response must include two labeled parts:
-
-1) **Creative Insight** — imaginative expansion (themes, symbolism, worldbuilding, character beats, dialogue options, sensory detail, metaphor, title lines). Offer 2–4 concrete upgrades.
-
-2) **Critical Feedback** — honest, concise, actionable critique that raises the work toward bestseller quality. Focus on clarity of motivation, stakes, pacing, tension curve, POV control, redundancy, cliché risk, and market fit. Provide fixes, not just flags.
-
-Guardrails:
-- Never sugarcoat. If something’s weak, say why and show a better version.
-- Prefer specificity over generalities; cite exact lines/beat locations when possible.
-- Maintain James’s voice; suggest edits that preserve tone and intent.
-- If asked for outline/structure, ensure beats align with his Writing-from-the-Middle template.
-
-Answer format (always):
-**Creative Insight:** …
-**Critical Feedback:** …
-    `.trim()
-
-    if (isMuseOnly) {
-      lyraPrompt = lyraPrompt.replace(
-        "Answer format (always):",
-        "Answer format (Muse Only):\n**Creative Insight:** …"
-      )
-    }
-    if (isEditorOnly) {
-      lyraPrompt = lyraPrompt.replace(
-        "Answer format (always):",
-        "Answer format (Editor Only):\n**Critical Feedback:** …"
-      )
-    }
-
-    const messages = [
-      { role:'system', content: lyraPrompt },
-      ...history,
-      { role:'user', content:`Context:\n${contextBlock}\n\nQuestion: ${question}` }
-    ]
-
-    const stream = await openai.chat.completions.create({
-      model: MODEL_CHAT,
-      messages, temperature: 0.7, stream: true
-    })
-
-    for await (const chunk of stream) {
-      const delta = chunk?.choices?.[0]?.delta?.content || ''
-      if (delta) res.write(`data:${JSON.stringify({ delta })}\n\n`)
-    }
-    res.write(`data:${JSON.stringify({ done:true, used_context: ctx })}\n\n`)
-    res.end()
-  } catch (e) {
-    res.write(`data:${JSON.stringify({ error:String(e.message || e) })}\n\n`)
-    res.end()
-  }
-})
-
-// ---------- WRITE: save a new doc + embed (with optional meta) ----------
-app.post('/ingest', requireAuth, enforceProjectFreshness, async (req, res) => {
-  try {
-    const { project_id, project_name, doc_type, title, body_md, tags = [], meta, synopsis = undefined, beats = undefined, scene_text = undefined } = req.body || {};
-    let bodyComputed = body_md;
-    const mapped = applyOutlineFields({ doc_type, incoming: { synopsis, beats, scene_text, body_md }, current: {} });
-    const metaObj = { ...coerceMeta(meta), ...('synopsis' in mapped.meta ? { synopsis: mapped.meta.synopsis } : {}), ...('beats' in mapped.meta ? { beats: mapped.meta.beats } : {}) };
-    if (!bodyComputed) bodyComputed = mapped.body_md;
-    if (!doc_type || !title || !bodyComputed) {
-      return res.status(400).json({ error: 'doc_type, title, body_md required (plus project_id or project_name)' });
-    }
-    const pid = await resolveProjectId(project_id, project_name);
-
-    const insertDocSQL = `
-      INSERT INTO documents (project_id, doc_type, title, body_md, tags, meta, created_at, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6, now(), now())
-      RETURNING id
-    `;
-    const { rows } = await pool.query(insertDocSQL, [pid, doc_type, title, bodyComputed, tags, JSON.stringify(metaObj)]);
-    const doc_id = rows[0].id;
-
-    const paragraphs = bodyComputed.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
-    const chunks = paragraphs.length ? paragraphs : [bodyComputed];
-
-    for (let i = 0; i < chunks.length; i += 16) {
-      const batch = chunks.slice(i, i + 16);
-      const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch });
-      for (let j = 0; j < batch.length; j++) {
-        const vecStr = `[${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]`;
-        const embMeta = { title, doc_type, ...metaObj };
-        await pool.query(
-          `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
-           VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
-          [pid, doc_id, i + j + 1, batch[j], vecStr, JSON.stringify(embMeta)]
-        );
-      }
-    }
-
-    res.json({ ok: true, document_id: doc_id });
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-})
-
-// ---------- SCENES: Postgres-backed persistence ----------
-
-// Save/append one chunk directly
-app.post('/scenes/upsert', requireAuth, async (req, res) => {
-  try {
-    const { project, chapterId, sceneId, content, mode = 'overwrite' } = req.body || {};
-    if (!project || !chapterId || !sceneId) {
-      return res.status(400).json({ error: 'project, chapterId, sceneId required' })
-    }
-    if (typeof content !== 'string' || !content.trim()) {
-      return res.status(400).json({ error: 'content must be a non-empty string' })
-    }
-
-    let finalContent = content
-    if (mode === 'append') {
-      const { rows } = await pool.query(
-        `SELECT content FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
-        [project, chapterId, sceneId]
-      );
-      const prev = rows[0]?.content || ""
-      finalContent = prev ? `${prev}\n\n${content}` : content
-    }
-
-    await pool.query(
-      `INSERT INTO scenes (project, chapter_id, scene_id, content, updated_at)
-       VALUES ($1,$2,$3,$4, now())
-       ON CONFLICT (project, chapter_id, scene_id)
-       DO UPDATE SET content = EXCLUDED.content, updated_at = now()`,
-      [project, chapterId, sceneId, finalContent]
-    )
-
-    const { rows: R } = await pool.query(
-      `SELECT length(content) AS len FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
-      [project, chapterId, sceneId]
-    )
-
-    res.json({ ok: true, project, chapterId, sceneId, mode, length: Number(R[0].len) })
-  } catch (err) {
-    console.error('upsert scene error', err)
-    res.status(500).json({ error: 'internal_error', detail: String(err?.message || err) })
-  }
-})
-
-// Paste a full scene; server splits & upserts sequentially
-app.post('/scenes/paste', async (req, res) => {
-  try {
-    const { project, chapterId, sceneId, content, maxChunk = 12000 } = req.body || {};
-
-    if (!project || !chapterId || !sceneId) {
-      return res.status(400).json({ error: 'project, chapterId, and sceneId are required' });
-    }
-    if (typeof content !== 'string' || !content.trim()) {
-      return res.status(400).json({ error: 'content must be a non-empty string' });
-    }
-    if (content.length > 1_000_000) {
-      return res.status(413).json({ error: 'content too large (>1MB). Consider splitting logically.' });
-    }
-
-    const chunks = chunkText(content, Number(maxChunk) || 12000);
-
-    const results = [];
-    for (let i = 0; i < chunks.length; i++) {
-      const mode = i === 0 ? 'overwrite' : 'append';
-
-      let finalContent = chunks[i]
-      if (mode === 'append') {
-        const { rows } = await pool.query(
-          `SELECT content FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
-          [project, chapterId, sceneId]
-        );
-        const prev = rows[0]?.content || ""
-        finalContent = prev ? `${prev}\n\n${chunks[i]}` : chunks[i]
-      }
-
-      await pool.query(
-        `INSERT INTO scenes (project, chapter_id, scene_id, content, updated_at)
-         VALUES ($1,$2,$3,$4, now())
-         ON CONFLICT (project, chapter_id, scene_id)
-         DO UPDATE SET content = EXCLUDED.content, updated_at = now()`,
-        [project, chapterId, sceneId, finalContent]
-      )
-
-      const { rows: R } = await pool.query(
-        `SELECT length(content) AS len FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
-        [project, chapterId, sceneId]
-      )
-
-      results.push({ ok: true, project, chapterId, sceneId, mode, chunkIndex: i, chunkCount: chunks.length, length: Number(R[0].len) })
-    }
-
-    return res.json({ ok: true, project, chapterId, sceneId, chunks: chunks.length, maxChunk, results });
-  } catch (err) {
-    console.error('paste error', err);
-    return res.status(500).json({ error: 'internal_error', detail: String(err?.message || err) });
-  }
-})
-
-// Read back a stored scene
-app.get('/scenes/get', async (req, res) => {
-  try {
-    const { project, chapterId, sceneId } = req.query || {};
-    if (!project || !chapterId || !sceneId) {
-      return res.status(400).json({ error: 'project, chapterId, sceneId required' });
-    }
-
-    const { rows } = await pool.query(
-      `SELECT content, updated_at FROM scenes
-       WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
-      [project, chapterId, sceneId]
-    );
-
-    if (!rows.length) return res.status(404).json({ error: 'not_found' });
-
-    res.json({
-      ok: true,
-      project, chapterId, sceneId,
-      length: rows[0].content.length,
-      updated_at: rows[0].updated_at,
-      content: rows[0].content
-    });
-  } catch (err) {
-    console.error('get scene error', err);
-    res.status(500).json({ error: 'internal_error', detail: String(err?.message || err) });
-  }
-});
-
-// List scenes for a project (optional chapter filter)
-app.get('/scenes/list', async (req, res) => {
-  try {
-    const { project, chapterId, limit = 100 } = req.query || {}
-    if (!project) return res.status(400).json({ error: 'project required' })
-    const lim = Math.min(parseInt(limit, 10) || 100, 500)
-
-    const clauses = ['project = $1']
-    const vals = [project]
-    let idx = 2
-    if (chapterId) { clauses.push(`chapter_id = $${idx++}`); vals.push(chapterId) }
-
-    const { rows } = await pool.query(
-      `SELECT project, chapter_id, scene_id, left(content, 120) AS snippet, updated_at, length(content) AS length
-         FROM scenes
-        WHERE ${clauses.join(' AND ')}
-        ORDER BY updated_at DESC
-        LIMIT $${idx}`,
-      [...vals, lim]
-    )
-
-    res.json({ items: rows })
-  } catch (err) {
-    console.error('list scenes error', err)
-    res.status(500).json({ error: 'internal_error', detail: String(err?.message || err) })
-  }
-})
-
-// Delete a scene (protected)
-app.delete('/scenes/delete', requireAuth, async (req, res) => {
-  try {
-    const { project, chapterId, sceneId } = req.query || {}
-    if (!project || !chapterId || !sceneId) {
-      return res.status(400).json({ error: 'project, chapterId, sceneId required' })
-    }
-    const { rowCount } = await pool.query(
-      `DELETE FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
-      [project, chapterId, sceneId]
-    )
-    if (rowCount === 0) return res.status(404).json({ error: 'not_found' })
-    res.json({ ok: true, project, chapterId, sceneId })
-  } catch (err) {
-    console.error('delete scene error', err)
-    res.status(500).json({ error: 'internal_error', detail: String(err?.message || err) })
-  }
-})
-
-// ---------- DOC UPSERT & EMBEDDING HELPERS ----------
-async function upsertDocumentByTitle({ projectId, title, body_md, doc_type='scene', tags=[], meta={}, docMode='upsert' }) {
-  // docMode: 'upsert' | 'create' | 'update'
-  const found = await pool.query(
-    `SELECT id FROM documents WHERE project_id = $1 AND title = $2 ORDER BY updated_at DESC LIMIT 1`,
-    [projectId, title]
-  );
-  let document_id;
-  if (found.rows.length) {
-    if (docMode === 'create') throw new Error('Document exists; docMode=create prevented overwrite');
-    document_id = found.rows[0].id;
-    const sets = ['updated_at = now()', 'body_md = $1', 'tags = $2', 'meta = $3::jsonb'];
-    await pool.query(
-      `UPDATE documents SET ${sets.join(', ')} WHERE id = $4`,
-      [body_md, tags, JSON.stringify(meta), document_id]
-    );
-    await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id]);
-  } else {
-    if (docMode === 'update') throw new Error('Document not found; docMode=update prevented create');
-    const ins = await pool.query(
-      `INSERT INTO documents (project_id, doc_type, title, body_md, tags, meta, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6, now(), now())
-       RETURNING id`,
-      [projectId, doc_type, title, body_md, tags, JSON.stringify(meta)]
-    );
-    document_id = ins.rows[0].id;
-  }
-
-  // Embed (paragraph chunks)
-  const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
-  const chunks = paragraphs.length ? paragraphs : [body_md];
-
-  for (let i = 0; i < chunks.length; i += 16) {
-    const batch = chunks.slice(i, i + 16);
-    const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch });
-    for (let j = 0; j < batch.length; j++) {
-      const vecStr = `[${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]`;
-      const embMeta = { title, doc_type, ...meta };
-      await pool.query(
-        `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
-         VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
-        [projectId, document_id, i + j + 1, batch[j], vecStr, JSON.stringify(embMeta)]
-      );
-    }
-  }
-  return document_id;
-}
-
-// ---------- LYRA: PASTE → SAVE (scenes + document) → CRITIQUE ----------
-// Added mode flags:
-//   sceneWriteMode: 'overwrite' | 'append' | 'auto'   (default 'auto': split; first chunk overwrites, rest append)
-//   docMode:        'upsert' | 'create' | 'update'    (default 'upsert')
-app.post('/lyra/paste-save', requireAuth, enforceProjectFreshness, async (req, res) => {
-  try {
-    const {
-      project_id,
-      project_name,
-      chapterId,
-      sceneId,
-      title,        // document title for RAG (required to upsert)
-      content,      // full scene text
-      tags = [],
-      meta = {},
-      maxChunk = 12000,
-      doc_type = 'scene',
-      critique = 'both',  // 'both' | 'muse-only' | 'editor-only'
-      saveToScenes = true,
-      saveToDocuments = true,
-      sceneWriteMode = 'auto', // 'overwrite' | 'append' | 'auto'
-      docMode = 'upsert'       // 'upsert' | 'create' | 'update'
-    } = req.body || {};
-
-    if (!content || !title) {
-      return res.status(400).json({ error: 'title and content are required' });
-    }
-
-    const pid = await resolveProjectId(project_id, project_name);
-
-    // 1) Save into scenes table (optional)
-    let sceneWrite = null;
-    if (saveToScenes) {
-      if (!chapterId || !sceneId) {
-        return res.status(400).json({ error: 'chapterId and sceneId required when saveToScenes is true' });
-      }
-
-      const modeNorm = String(sceneWriteMode || 'auto').toLowerCase();
-      if (modeNorm === 'overwrite') {
-        await pool.query(
-          `INSERT INTO scenes (project, chapter_id, scene_id, content, updated_at)
-           VALUES ($1,$2,$3,$4, now())
-           ON CONFLICT (project, chapter_id, scene_id)
-           DO UPDATE SET content = EXCLUDED.content, updated_at = now()`,
-          [project_name || project_id, chapterId, sceneId, content]
-        );
-      } else if (modeNorm === 'append') {
-        const { rows } = await pool.query(
-          `SELECT content FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
-          [project_name || project_id, chapterId, sceneId]
-        );
-        const prev = rows[0]?.content || "";
-        const finalContent = prev ? `${prev}\n\n${content}` : content;
-        await pool.query(
-          `INSERT INTO scenes (project, chapter_id, scene_id, content, updated_at)
-           VALUES ($1,$2,$3,$4, now())
-           ON CONFLICT (project, chapter_id, scene_id)
-           DO UPDATE SET content = EXCLUDED.content, updated_at = now()`,
-          [project_name || project_id, chapterId, sceneId, finalContent]
-        );
-      } else {
-        // 'auto' → split into chunks and write overwrite+append sequence
-        const chunks = chunkText(content, Number(maxChunk) || 12000);
-        for (let i = 0; i < chunks.length; i++) {
-          const isAppend = i > 0;
-          let finalContent = chunks[i];
-          if (isAppend) {
-            const { rows } = await pool.query(
-              `SELECT content FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
-              [project_name || project_id, chapterId, sceneId]
-            );
-            const prev = rows[0]?.content || "";
-            finalContent = prev ? `${prev}\n\n${chunks[i]}` : chunks[i];
-          }
-
-          await pool.query(
-            `INSERT INTO scenes (project, chapter_id, scene_id, content, updated_at)
-             VALUES ($1,$2,$3,$4, now())
-             ON CONFLICT (project, chapter_id, scene_id)
-             DO UPDATE SET content = EXCLUDED.content, updated_at = now()`,
-            [project_name || project_id, chapterId, sceneId, finalContent]
-          );
-        }
-      }
-
-      const { rows: R } = await pool.query(
-        `SELECT length(content) AS len FROM scenes WHERE project=$1 AND chapter_id=$2 AND scene_id=$3`,
-        [project_name || project_id, chapterId, sceneId]
-      );
-      sceneWrite = { ok: true, project: project_name || project_id, chapterId, sceneId, length: Number(R[0].len), sceneWriteMode: modeNorm };
-    }
-
-    // 2) Upsert into documents + embeddings (optional)
-    let document_id = null;
-    if (saveToDocuments) {
-      const metaFull = { ...meta };
-      if (chapterId) metaFull.chapter = metaFull.chapter ?? chapterId;
-      if (sceneId) metaFull.scene = metaFull.scene ?? sceneId;
-      document_id = await upsertDocumentByTitle({
-        projectId: pid, title, body_md: content, doc_type, tags, meta: metaFull, docMode
-      });
-    }
-
-    // 3) Lyra critique
-    const isMuseOnly = /muse-only/i.test(critique);
-    const isEditorOnly = /editor-only/i.test(critique);
-
-    let lyraPrompt = `
-You are **Lyra**, James’s creative muse **and** critical editor for the project "${project_name || 'Untitled'}".
-
-Every response must include two labeled parts:
-
-1) **Creative Insight** — imaginative expansion (themes, symbolism, worldbuilding, character beats, dialogue options, sensory detail, metaphor, title lines). Offer 2–4 concrete upgrades.
-
-2) **Critical Feedback** — honest, concise, actionable critique that raises the work toward bestseller quality. Focus on clarity of motivation, stakes, pacing, tension curve, POV control, redundancy, cliché risk, and market fit. Provide fixes, not just flags.
-
-Guardrails:
-- Never sugarcoat. If something’s weak, say why and show a better version.
-- Prefer specificity over generalities; cite exact lines/beat locations when possible.
-- Maintain James’s voice; suggest edits that preserve tone and intent.
-- If asked for outline/structure, ensure beats align with his Writing-from-the-Middle template.
-
-Answer format (always):
-**Creative Insight:** …
-**Critical Feedback:** …
-    `.trim();
-
-    if (isMuseOnly) {
-      lyraPrompt = lyraPrompt.replace(
-        "Answer format (always):",
-        "Answer format (Muse Only):\n**Creative Insight:** …"
-      );
-    }
-    if (isEditorOnly) {
-      lyraPrompt = lyraPrompt.replace(
-        "Answer format (always):",
-        "Answer format (Editor Only):\n**Critical Feedback:** …"
-      );
-    }
-
-    const messages = [
-      { role: 'system', content: lyraPrompt },
-      { role: 'user', content: `Context:\n${content}\n\nQuestion: Review this scene and suggest targeted improvements.` }
-    ];
-
-    const gpt = await openai.chat.completions.create({
-      model: MODEL_CHAT,
-      messages,
-      temperature: 0.7
-    });
-
-    res.json({
-      ok: true,
-      build: APP_BUILD,
-      saved: {
-        scene: sceneWrite,
-        document_id
-      },
-      critique: gpt.choices?.[0]?.message?.content || ''
-    });
-  } catch (e) {
-    console.error('lyra/paste-save error', e);
-    res.status(500).json({ error: 'internal_error', detail: String(e?.message || e) });
-  }
-});
-
-// ---------- UPDATE / RE-EMBED ----------
-app.post('/update', requireAuth, enforceProjectFreshness, async (req, res) => {
-  try {
-    const { document_id, project_id, project_name, title, body_md, tags, meta, synopsis = undefined, beats = undefined, scene_text = undefined } = req.body || {};
-    if (!document_id || (!title && !body_md && !tags && !meta)) {
-      return res.status(400).json({ error: 'document_id and one of title/body_md/tags/meta required (plus project_id or project_name)' });
-    }
-    const pid = await resolveProjectId(project_id, project_name);
-
-    const curQ = await pool.query(`SELECT title, doc_type, body_md, meta, tags FROM documents WHERE id = $1`, [document_id]);
-    if (!curQ.rows.length) return res.status(404).json({ error: 'Document not found' });
-    const current = curQ.rows[0];
-    const mapped = applyOutlineFields({ doc_type: current.doc_type, incoming: { synopsis, beats, scene_text, body_md }, current });
-    const metaObj = { ...coerceMeta(current.meta), ...coerceMeta(meta), ...('synopsis' in mapped.meta ? { synopsis: mapped.meta.synopsis } : {}), ...('beats' in mapped.meta ? { beats: mapped.meta.beats } : {}) };
-
-    const sets = [];
-    const vals = [];
-    let idx = 1;
-
-    if (title)   { sets.push(`title = $${idx++}`);        vals.push(title); }
-    if (mapped.body_md && mapped.body_md !== current.body_md) { sets.push(`body_md = $${idx++}`); vals.push(mapped.body_md); }
-    if (tags)    { sets.push(`tags = $${idx++}`);         vals.push(tags); }
-    if (meta || 'synopsis' in mapped.meta || 'beats' in mapped.meta) { sets.push(`meta = $${idx++}::jsonb`);  vals.push(JSON.stringify(coerceMeta(metaObj))); }
-
-    sets.push(`updated_at = now()`);
-    vals.push(pid, document_id);
-
-    const { rowCount } = await pool.query(
-      `UPDATE documents SET ${sets.join(', ')} WHERE project_id = $${idx++} AND id = $${idx}`,
-      vals
-    );
-    if (rowCount === 0) return res.status(404).json({ error: 'Document not found for this project' });
-
-    if (mapped.body_md && mapped.body_md !== current.body_md) {
-      await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id]);
-
-      const docQ = await pool.query(
-        `SELECT title, doc_type, meta FROM documents WHERE id = $1`,
-        [document_id]
-      );
-      const current = docQ.rows[0] || {};
-      const embTitle = title ?? current.title ?? '(updated)';
-      const embDocType = current.doc_type || 'update';
-      const embMetaBase = coerceMeta(meta ?? current.meta);
-
-      const paragraphs = mapped.body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
-      const chunks = paragraphs.length ? paragraphs : [mapped.body_md];
-
-      for (let i = 0; i < chunks.length; i += 16) {
-        const batch = chunks.slice(i, i + 16);
-        const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch });
-        for (let j = 0; j < batch.length; j++) {
-          const vecStr = `[${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]`;
-          const embMeta = { title: embTitle, doc_type: embDocType, ...embMetaBase };
-          await pool.query(
-            `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
-             VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
-            [pid, document_id, i + j + 1, batch[j], vecStr, JSON.stringify(embMeta)]
-          );
-        }
-      }
-    }
-
-    res.json({ ok: true, document_id });
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-})
-
-// ---------- UPDATE BY TITLE ----------
-app.post('/update-by-title', requireAuth, enforceProjectFreshness, async (req, res) => {
-  try {
-    const { project_id, project_name, title, body_md, tags, meta, synopsis = undefined, beats = undefined, scene_text = undefined } = req.body || {};
-    if (!title || (!body_md && !tags && !meta)) {
-      return res.status(400).json({ error: 'title and one of body_md/tags/meta required (plus project_id or project_name)' });
-    }
-    const pid = await resolveProjectId(project_id, project_name);
-
-    const found = await pool.query(
-      `SELECT id FROM documents WHERE project_id = $1 AND title = $2 ORDER BY updated_at DESC LIMIT 1`,
-      [pid, title]
-    );
-    if (!found.rows.length) return res.status(404).json({ error: 'Document not found' });
-
-    const document_id = found.rows[0].id;
-
-    const curQ2 = await pool.query(`SELECT title, doc_type, body_md, meta, tags FROM documents WHERE id = $1`, [document_id]);
-    const current2 = curQ2.rows[0];
-    const mapped2 = applyOutlineFields({ doc_type: current2.doc_type, incoming: { synopsis, beats, scene_text, body_md }, current: current2 });
-    const metaObj2 = { ...coerceMeta(current2.meta), ...coerceMeta(meta), ...('synopsis' in mapped2.meta ? { synopsis: mapped2.meta.synopsis } : {}), ...('beats' in mapped2.meta ? { beats: mapped2.meta.beats } : {}) };
-
-    const sets = [];
-    const vals = [];
-    let idx = 1;
-
-    if (mapped.body_md && mapped.body_md !== current.body_md) { sets.push(`body_md = $${idx++}`); vals.push(mapped.body_md); }
-    if (tags)    { sets.push(`tags = $${idx++}`);         vals.push(tags); }
-    if (meta || 'synopsis' in mapped.meta || 'beats' in mapped.meta) { sets.push(`meta = $${idx++}::jsonb`);  vals.push(JSON.stringify(coerceMeta(metaObj))); }
-
-    sets.push(`updated_at = now()`);
-    vals.push(pid, document_id);
-
-    await pool.query(
-      `UPDATE documents SET ${sets.join(', ')} WHERE project_id = $${idx++} AND id = $${idx}`,
-      vals
-    );
-
-    if (mapped.body_md && mapped.body_md !== current.body_md) {
-      await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id]);
-
-      const docQ = await pool.query(
-        `SELECT title, doc_type, meta FROM documents WHERE id = $1`,
-        [document_id]
-      );
-      const current = docQ.rows[0] || {};
-      const embTitle = current.title || title;
-      const embDocType = current.doc_type || 'update';
-      const embMetaBase = coerceMeta(meta ?? current.meta);
-
-      const paragraphs = mapped.body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
-      const chunks = paragraphs.length ? paragraphs : [mapped.body_md];
-
-      for (let i = 0; i < chunks.length; i += 16) {
-        const batch = chunks.slice(i, i + 16);
-        const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch });
-        for (let j = 0; j < batch.length; j++) {
-          const vecStr = `[${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]`;
-          const embMeta = { title: embTitle, doc_type: embDocType, ...embMetaBase };
-          await pool.query(
-            `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
-             VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
-            [pid, document_id, i + j + 1, batch[j], vecStr, JSON.stringify(embMeta)]
-          );
-        }
-      }
-    }
-
-    res.json({ ok: true, document_id });
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-})
-
-// ---------- LIST DOCS ----------
-app.get('/list-docs', async (req, res) => {
-  try {
-    const { project_id, project_name, doc_type, q } = req.query
-    const pid = await resolveProjectId(project_id, project_name)
-    const limit = Math.min(parseInt(req.query.limit || '25', 10), 100)
-
-    const clauses = ['project_id = $1']
-    const vals = [pid]
-    let idx = 2
-    if (doc_type) { clauses.push(`doc_type = $${idx++}`); vals.push(doc_type) }
-    if (q)        { clauses.push(`(title ILIKE $${idx} OR tags::text ILIKE $${idx})`); vals.push(`%${q}%`); idx++ }
-
-    const { rows } = await pool.query(
-      `SELECT id, title, doc_type, tags, created_at, updated_at
-         FROM documents
-        WHERE ${clauses.join(' AND ')}
-        ORDER BY updated_at DESC
-        LIMIT $${idx}`,
-      [...vals, limit]
-    )
-    res.json({ items: rows })
-  } catch (e) {
-    const code = e.statusCode || 500
-    res.status(code).json({ error: String(e.message || e) })
-  }
-})
-
-// ---------- DOC READERS ----------
-app.get('/doc', async (req, res) => {
-  try {
-    const { id } = req.query
-    if (!id) return res.status(400).json({ error: 'id (document UUID) required' })
-    const { rows } = await pool.query(
-      `SELECT id, project_id, title, doc_type, tags, body_md, created_at, updated_at
-         FROM documents
-        WHERE id = $1
-        LIMIT 1`,
-      [id]
-    )
-    if (!rows.length) return res.status(404).json({ error: 'Document not found' })
-    res.json(rows[0])
-  } catch (e) {
-    const code = e.statusCode || 500
-    res.status(code).json({ error: String(e.message || e) })
-  }
-})
-
-app.get('/doc-by-title', async (req, res) => {
-  try {
-    const { project_id, project_name, title } = req.query
-    if (!title) return res.status(400).json({ error: 'title required' })
-    const pid = await resolveProjectId(project_id, project_name)
-    const { rows } = await pool.query(
-      `SELECT id, project_id, title, doc_type, tags, body_md, created_at, updated_at
-         FROM documents
-        WHERE project_id = $1 AND title = $2
-        ORDER BY updated_at DESC
-        LIMIT 1`,
-      [pid, title]
-    )
-    if (!rows.length) return res.status(404).json({ error: 'Document not found' })
-    res.json(rows[0])
-  } catch (e) {
-    const code = e.statusCode || 500
-    res.status(code).json({ error: String(e.message || e) })
-  }
-})
-
-// ---------- OpenAPI 3.1.0 for GPT Actions ----------
-
-// ---------- ARCHIVE & REDIRECT (soft-delete via meta) ----------
-
-// Title normalizer (lowercase + collapse whitespace)
-function normalizeTitle(t) {
-  return (t || "").toLowerCase().replace(/\s+/g, " ").trim();
-}
-
-// Simple merge for plain objects (right wins)
-function mergeShallow(a = {}, b = {}) {
-  const out = { ...(a || {}) };
-  for (const k of Object.keys(b || {})) {
-    if (b[k] === undefined) continue;
-    out[k] = b[k];
-  }
-  return out;
-}
-
-// Ensure unique strings
-function uniq(arr = []) {
-  return Array.from(new Set((arr || []).filter(Boolean)));
-}
-
-// Map db row to doc object
-function rowToDoc(r) {
+// Mapper: DB row -> API doc (future-proofing if DB schema differs)
+function mapDoc(row) {
+  if (!row) return null;
+  const {
+    id, project_id, doc_type, title, body_md, tags, meta,
+    created_at, updated_at, deleted_at
+  } = row;
   return {
-    doc_id: r.id,
-    project_id: r.project_id,
-    title: r.title,
-    doc_type: r.doc_type,
-    body_md: r.body_md,
-    tags: Array.isArray(r.tags) ? r.tags : [],
-    meta: coerceMeta(r.meta),
-    updated_at: r.updated_at
+    id, project_id, doc_type, title, body_md, tags, meta, created_at, updated_at,
+    deleted: !!deleted_at
   };
 }
 
-// List docs by exact (case-insensitive) title + type for a project
-async function listDocsByTitleAndTypePg(projectId, title, doc_type) {
-  const { rows } = await pool.query(
-    `SELECT id, project_id, title, doc_type, body_md, tags, meta, updated_at
-       FROM documents
-      WHERE project_id = $1
-        AND doc_type = $2
-        AND lower(title) = lower($3)
-      ORDER BY updated_at DESC`,
-    [projectId, doc_type, title]
-  );
-  return rows.map(rowToDoc);
-}
-
-function pickCanonical(docs, strategy = "newest", explicitId = null) {
-  if (!Array.isArray(docs) || docs.length === 0) return null;
-  if (explicitId) {
-    const x = docs.find(d => d.doc_id === explicitId);
-    if (x) return x;
-  }
-  if (strategy === "oldest") {
-    return docs.slice().sort((a,b)=> new Date(a.updated_at) - new Date(b.updated_at))[0];
-  }
-  return docs.slice().sort((a,b)=> new Date(b.updated_at) - new Date(a.updated_at))[0];
-}
-
-function prependBanner(md, canonicalId) {
-  const banner = `> ⚠️ Archived duplicate. See canonical: ${canonicalId}.\n\n`;
-  return banner + (md || "");
-}
-
-// Direct document update (without extra HTTP hop); re-embeds if body changes
-async function _updateDocDirect({ project_id, document_id, title, body_md, tags, meta }) {
-  const sets = [];
-  const vals = [];
-  let idx = 1;
-
-  if (title)   { sets.push(`title = $\${idx++}`);        vals.push(title); }
-  if (mapped.body_md && mapped.body_md !== current.body_md) { sets.push(`body_md = $\${idx++}`);      vals.push(body_md); }
-  if (tags)    { sets.push(`tags = $\${idx++}`);         vals.push(tags); }
-  if (meta)    { sets.push(`meta = $\${idx++}::jsonb`);  vals.push(JSON.stringify(coerceMeta(meta))); }
-
-  sets.push(`updated_at = now()`);
-  vals.push(project_id, document_id);
-
-  const { rowCount } = await pool.query(
-    `UPDATE documents SET ${sets.join(', ')} WHERE project_id = $\${idx++} AND id = $\${idx}`,
-    vals
-  );
-  if (rowCount === 0) throw new Error('Document not found for this project');
-
-  if (mapped.body_md && mapped.body_md !== current.body_md) {
-    await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id]);
-
-    const docQ = await pool.query(`SELECT title, doc_type, meta FROM documents WHERE id = $1`, [document_id]);
-    const current = docQ.rows[0] || {};
-    const embTitle = title ?? current.title ?? '(updated)';
-    const embDocType = current.doc_type || 'update';
-    const embMetaBase = coerceMeta(meta ?? current.meta);
-
-    const paragraphs = bodyComputed.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
-    const chunks = paragraphs.length ? paragraphs : [bodyComputed];
-
-    for (let i = 0; i < chunks.length; i += 16) {
-      const batch = chunks.slice(i, i + 16);
-      const resp = await openai.embeddings.create({ model: MODEL_EMBED, input: batch });
-      for (let j = 0; j < batch.length; j++) {
-        const vecStr = `[\${resp.data[j].embedding.map(v => v.toFixed(8)).join(',')}]`;
-        const embMeta = { title: embTitle, doc_type: embDocType, ...embMetaBase };
-        await pool.query(
-          `INSERT INTO embeddings (project_id, document_id, chunk_no, chunk_text, embedding, meta)
-           VALUES ($1,$2,$3,$4,$5::vector,$6::jsonb)`,
-          [project_id, document_id, i + j + 1, batch[j], vecStr, JSON.stringify(embMeta)]
-        );
-      }
+// CamelCase alias shim: let clients send projectName/docType/bodyMd
+function camelCaseAliasShim(req, res, next) {
+  if (req.body && typeof req.body === 'object') {
+    const b = req.body;
+    // Project aliases
+    if (!b.project_name && b.projectName) b.project_name = b.projectName;
+    if (!b.project_id && b.projectId) b.project_id = b.projectId;
+    // Doc aliases
+    if (b.payload && typeof b.payload === 'object') {
+      const p = b.payload;
+      if (!p.doc_type && p.docType) p.doc_type = p.docType;
+      if (!p.body_md && p.bodyMd) p.body_md = p.bodyMd;
     }
+    if (!b.docMode && b.mode) b.docMode = b.mode;
+    if (!b.sceneWriteMode && b.writeMode) b.sceneWriteMode = b.writeMode;
   }
-}
-
-// Archive duplicates and redirect to canonical
-app.post('/archive-redirect', requireAuth, enforceProjectFreshness, async (req, res) => {
-  try {
-    const {
-      project_id, project_name,
-      title, doc_type,
-      canonical_doc_id = null,
-      strategy = 'newest',
-      add_banner = false
-    } = req.body || {};
-
-    if (!title || !doc_type) return res.status(400).json({ error: 'title and doc_type are required' });
-
-    const pid = await resolveProjectId(project_id, project_name || undefined);
-    const docs = await listDocsByTitleAndTypePg(pid, title, doc_type);
-    if (!docs.length) return res.json({ ok: true, message: 'No matching documents' });
-    if (docs.length === 1) return res.json({ ok: true, message: 'Only one doc; nothing to archive', canonical: { id: docs[0].doc_id, title: docs[0].title } });
-
-    const canonical = pickCanonical(docs, strategy, canonical_doc_id);
-    const dupes = docs.filter(d => d.doc_id !== canonical.doc_id);
-
-    // 1) Add aliases to canonical meta
-    const aliasTitles = uniq(dupes.map(d => d.title));
-    const canonMeta = coerceMeta(canonical.meta);
-    const newAliases = uniq([...(canonMeta.aliases || []), ...aliasTitles]);
-    const canonTags = uniq([...(canonical.tags || []), 'deduped','canonical']);
-
-    await _updateDocDirect({
-      project_id: pid,
-      document_id: canonical.doc_id,
-      meta: mergeShallow(canonMeta, { aliases: newAliases }),
-      tags: canonTags
-    });
-
-    // 2) Archive each duplicate
-    const archived = [];
-    for (const dupe of dupes) {
-      const dmeta = coerceMeta(dupe.meta);
-      const lifecycle = mergeShallow(dmeta.lifecycle, { status: 'archived', reason: 'duplicate' });
-      const newMeta = mergeShallow(dmeta, { lifecycle, superseded_by: canonical.doc_id });
-      const newTags = uniq([...(dupe.tags || []), 'duplicate','archived']);
-      const body = add_banner ? prependBanner(dupe.body_md, canonical.doc_id) : dupe.body_md;
-
-      await _updateDocDirect({
-        project_id: pid,
-        document_id: dupe.doc_id,
-        body_md: body,
-        meta: newMeta,
-        tags: newTags
-      });
-      archived.push({ id: dupe.doc_id, title: dupe.title });
-    }
-
-    res.json({
-      ok: true,
-      canonical: { id: canonical.doc_id, title: canonical.title },
-      archived_count: archived.length,
-      archived
-    });
-  } catch (e) {
-    console.error('archive-redirect error', e);
-    res.status(500).json({ error: String(e?.message || e) });
-  }
-});
-
-// Update/append canonical body_md then archive & redirect duplicates
-app.post('/update-and-archive', requireAuth, enforceProjectFreshness, async (req, res) => {
-  try {
-    const {
-      project_id, project_name,
-      title, doc_type,
-      update_body_md = null,
-      merge_strategy = 'append',  // 'replace' | 'append'
-      canonical_doc_id = null,
-      strategy = 'newest',
-      add_banner = false
-    } = req.body || {};
-
-    if (!title || !doc_type) return res.status(400).json({ error: 'title and doc_type are required' });
-
-    const pid = await resolveProjectId(project_id, project_name || undefined);
-    const docs = await listDocsByTitleAndTypePg(pid, title, doc_type);
-    if (!docs.length) return res.status(404).json({ error: 'No matching documents' });
-
-    const canonical = pickCanonical(docs, strategy, canonical_doc_id);
-    const dupes = docs.filter(d => d.doc_id !== canonical.doc_id);
-
-    // 1) Update canonical body if provided
-    if (typeof update_body_md === 'string') {
-      let newBody = canonical.body_md || '';
-      if (merge_strategy === 'replace') newBody = update_body_md;
-      else newBody = (canonical.body_md || '') + (newBody && update_body_md ? '\n\n' : '') + update_body_md;
-
-      const canonMeta = coerceMeta(canonical.meta);
-      const canonTags = uniq([...(canonical.tags || []), 'deduped','canonical','merged']);
-
-      await _updateDocDirect({
-        project_id: pid,
-        document_id: canonical.doc_id,
-        body_md: newBody,
-        meta: canonMeta,
-        tags: canonTags
-      });
-    }
-
-    // 2) Add aliases from dupes
-    const aliasTitles = uniq(dupes.map(d => d.title));
-    const afterCanon = await pool.query('SELECT meta, tags FROM documents WHERE id = $1', [canonical.doc_id]);
-    const curMeta = coerceMeta(afterCanon.rows?.[0]?.meta);
-    const curAliases = uniq([...(curMeta.aliases || []), ...aliasTitles]);
-    const curTags = uniq([...(afterCanon.rows?.[0]?.tags || []), 'deduped','canonical']);
-
-    await _updateDocDirect({
-      project_id: pid,
-      document_id: canonical.doc_id,
-      meta: mergeShallow(curMeta, { aliases: curAliases }),
-      tags: curTags
-    });
-
-    // 3) Archive each duplicate
-    const archived = [];
-    for (const dupe of dupes) {
-      const dmeta = coerceMeta(dupe.meta);
-      const lifecycle = mergeShallow(dmeta.lifecycle, { status: 'archived', reason: 'duplicate' });
-      const newMeta = mergeShallow(dmeta, { lifecycle, superseded_by: canonical.doc_id });
-      const newTags = uniq([...(dupe.tags || []), 'duplicate','archived']);
-      const body = add_banner ? prependBanner(dupe.body_md, canonical.doc_id) : dupe.body_md;
-
-      await _updateDocDirect({
-        project_id: pid,
-        document_id: dupe.doc_id,
-        body_md: body,
-        meta: newMeta,
-        tags: newTags
-      });
-      archived.push({ id: dupe.doc_id, title: dupe.title });
-    }
-
-    res.json({
-      ok: true,
-      canonical: { id: canonical.doc_id, title: canonical.title },
-      updated_canonical: typeof update_body_md === 'string',
-      archived_count: archived.length,
-      archived
-    });
-  } catch (e) {
-    console.error('update-and-archive error', e);
-    res.status(500).json({ error: String(e?.message || e) });
-  }
-});
-
-// ----- Alias routes for camelCase callers (compat) -----
-app.post('/archiveRedirect', (req, res, next) => {
-  req.url = '/archive-redirect';
   next();
-});
-
-app.post('/updateAndArchive', (req, res, next) => {
-  req.url = '/update-and-archive';
-  next();
-});
-
-
-app.get('/openapi.json', (_req, res) => {
-  res.json(
-  {
-  "openapi": "3.1.0",
-  "info": {
-    "title": "Writer Brain API",
-    "version": APP_BUILD
-  },
-  "servers": [
-    { "url": "https://writer-api-p0c7.onrender.com" }
-  ],
-  "paths": {
-    "/lyra/paste-save": {
-      "post": {
-        "operationId": "lyraPasteSave",
-        "summary": "Paste full scene → save to scenes (mode) + upsert document (mode) → return Lyra critique",
-        "security": [ { "bearerAuth": [] } ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "project_id":   { "type": "string" },
-                  "project_name": { "type": "string" },
-                  "chapterId":    { "type": "string" },
-                  "sceneId":      { "type": "string" },
-                  "title":        { "type": "string" },
-                  "content":      { "type": "string" },
-                  "tags":         { "type": "array", "items": { "type": "string" } },
-                  "meta":         { "type": "object", "additionalProperties": true },
-                  "maxChunk":     { "type": "integer", "default": 12000 },
-                  "doc_type":     { "type": "string", "default": "scene" },
-                  "critique":     { "type": "string", "enum": ["both","muse-only","editor-only"], "default": "both" },
-                  "saveToScenes":    { "type": "boolean", "default": true },
-                  "saveToDocuments": { "type": "boolean", "default": true },
-                  "sceneWriteMode":  { "type": "string", "enum": ["overwrite","append","auto"], "default": "auto" },
-                  "docMode":         { "type": "string", "enum": ["upsert","create","update"], "default": "upsert" }
-                },
-                "required": ["title","content"],
-                "oneOf": [
-                  { "required": ["project_id"] },
-                  { "required": ["project_name"] }
-                ]
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": { "description": "Saved + critique" }
-        }
-      }
-    },
-
-    "/ask": {
-      "post": {
-        "operationId": "askProject",
-        "summary": "Retrieve an answer using RAG",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": ["question"],
-                "properties": {
-                  "question": { "type": "string" },
-                  "project_id": { "type": "string" },
-                  "project_name": { "type": "string" },
-                  "history": {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "role": { "type": "string", "enum": ["system", "user", "assistant"] },
-                        "content": { "type": "string" }
-                      },
-                      "required": ["role", "content"]
-                    }
-                  }
-                }
-              }
-            }
-          }
-        },
-        "responses": { "200": { "description": "Answer JSON" } }
-      }
-    },
-
-    "/ingest": {
-      "post": {
-        "operationId": "ingestDoc",
-        "summary": "Create a new document and embed it",
-        "security": [ { "bearerAuth": [] } ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "project_id":   { "type": "string", "description": "UUID of project" },
-                  "project_name": { "type": "string", "description": "Human-friendly name if you don't have the UUID" },
-                  "doc_type":     { "type": "string", "example": "artifact", "description": "character | chapter | scene | concept | artifact | location | ..." },
-                  "title":        { "type": "string" },
-                  "body_md":      { "type": "string" },
-                  "tags":         { "type": "array", "items": { "type": "string" } },
-                  "meta":         { "type": "object", "additionalProperties": true }
-                },
-                "required": ["doc_type","title"],
-                "oneOf": [
-                  { "required": ["project_id"] },
-                  { "required": ["project_name"] }
-                ]
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Ingested",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "ok": { "type": "boolean" },
-                    "document_id": { "type": "string", "format": "uuid" }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-
-    "/update": {
-      "post": {
-        "operationId": "updateDoc",
-        "summary": "Update an existing document by UUID and re-embed",
-        "security": [ { "bearerAuth": [] } ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "project_id":   { "type": "string", "description": "UUID of project" },
-                  "project_name": { "type": "string", "description": "Human-friendly name if you don't have the UUID" },
-                  "document_id":  { "type": "string", "format": "uuid" },
-                  "title":        { "type": "string" },
-                  "body_md":      { "type": "string" },
-                  "tags":         { "type": "array", "items": { "type": "string" } },
-                  "meta":         { "type": "object", "additionalProperties": true }
-                },
-                "required": ["document_id"],
-                "oneOf": [
-                  { "required": ["project_id","document_id"] },
-                  { "required": ["project_name","document_id"] }
-                ]
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Updated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "ok": { "type": "boolean" },
-                    "document_id": { "type": "string", "format": "uuid" }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-
-    "/update-by-title": {
-      "post": {
-        "operationId": "updateDocByTitle",
-        "summary": "Update a document by title (no UUID) and re-embed",
-        "security": [ { "bearerAuth": [] } ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "project_id":   { "type": "string", "description": "UUID of project" },
-                  "project_name": { "type": "string", "description": "Human-friendly project name" },
-                  "title":        { "type": "string", "description": "Document title to update" },
-                  "body_md":      { "type": "string" },
-                  "tags":         { "type": "array", "items": { "type": "string" } },
-                  "meta":         { "type": "object", "additionalProperties": true }
-                },
-                "required": ["title"],
-                "oneOf": [
-                  { "required": ["project_id","title"] },
-                  { "required": ["project_name","title"] }
-                ]
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Updated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "ok": { "type": "boolean" },
-                    "document_id": { "type": "string", "format": "uuid" }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-
-    "/doc": {
-      "get": {
-        "operationId": "getDoc",
-        "summary": "Get a single document by UUID (returns full body_md)",
-        "parameters": [
-          { "in": "query", "name": "id", "required": true, "schema": { "type": "string", "format": "uuid" } }
-        ],
-        "responses": { "200": { "description": "Document" } }
-      }
-    },
-
-    "/doc-by-title": {
-      "get": {
-        "operationId": "getDocByTitle",
-        "summary": "Get latest doc by title (by project name or id)",
-        "parameters": [
-          { "in": "query", "name": "project_id", "required": false, "schema": { "type": "string" } },
-          { "in": "query", "name": "project_name", "required": false, "schema": { "type": "string" } },
-          { "in": "query", "name": "title", "required": true, "schema": { "type": "string" } }
-        ],
-        "responses": { "200": { "description": "Document" } }
-      }
-    },
-
-    "/list-docs": {
-      "get": {
-        "operationId": "listDocs",
-        "summary": "List recent docs in a project",
-        "parameters": [
-          { "in": "query", "name": "project_id",   "required": false, "schema": { "type": "string" } },
-          { "in": "query", "name": "project_name", "required": false, "schema": { "type": "string" } },
-          { "in": "query", "name": "doc_type",     "required": false, "schema": { "type": "string" }, "description": "Filter by doc_type (e.g., character, note, chapter)" },
-          { "in": "query", "name": "q",            "required": false, "schema": { "type": "string" }, "description": "Search in title or tags (ILIKE)" },
-          { "in": "query", "name": "limit",        "required": false, "schema": { "type": "integer", "default": 25, "minimum": 1, "maximum": 100 } }
-        ],
-        "responses": { "200": { "description": "Document list" } }
-      }
-    },
-
-    "/projects": {
-      "get": {
-        "operationId": "listProjects",
-        "summary": "List all projects",
-        "security": [ { "bearerAuth": [] } ],
-        "responses": { "200": { "description": "Projects" } }
-      }
-    },
-
-    "/confirm-project": {
-      "post": {
-        "summary": "Confirm/refresh the active project for the current user",
-        "operationId": "confirmProject",
-        "security": [{ "bearerAuth": [] }],
-        "requestBody": { "required": false, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConfirmProjectRequest" } } } },
-        "responses": { "200": { "description": "OK" }, "409": { "description": "Project confirmation required" } }
-      }
-    },
-
-    "/project": {
-      "post": {
-        "operationId": "createOrGetProject",
-        "summary": "Create or get a project by name",
-        "security": [ { "bearerAuth": [] } ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": ["name"],
-                "properties": {
-                  "name": { "type": "string" },
-                  "description": { "type": "string" }
-                }
-              }
-            }
-          }
-        },
-        "responses": { "200": { "description": "Project id" } }
-      }
-    }
-  ,
-
-    "/archive-redirect": {
-      "post": {
-        "summary": "Archive duplicates and redirect to canonical",
-        "operationId": "archiveRedirect",
-        "security": [{ "bearerAuth": [] }],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": { "$ref": "#/components/schemas/ArchiveRedirectRequest" }
-            }
-          }
-        },
-        "responses": { "200": { "description": "OK" } }
-      }
-    },
-
-    "/update-and-archive": {
-      "post": {
-        "summary": "Update canonical then archive/redirect duplicates",
-        "operationId": "updateAndArchive",
-        "security": [{ "bearerAuth": [] }],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": { "$ref": "#/components/schemas/UpdateAndArchiveRequest" }
-            }
-          }
-        },
-        "responses": { "200": { "description": "OK" } }
-      }
-    }
-},
- 
-  
- "components": {
-    "securitySchemes": {
-      "bearerAuth": { "type": "http", "scheme": "bearer", "bearerFormat": "JWT" }
-    },
-    "schemas": {
-    "ArchiveRedirectRequest": {
-      "type": "object",
-      "required": ["title", "doc_type"],
-      "properties": {
-        "project_id":      { "type": "string" },
-        "project_name":    { "type": "string" },
-        "title":           { "type": "string" },
-        "doc_type":        { "type": "string", "enum": ["scene","chapter","concept","character","artifact","location"] },
-        "canonical_doc_id":{ "type": "string" },
-        "strategy":        { "type": "string", "enum": ["newest","oldest","explicit"], "default": "newest" },
-        "add_banner":      { "type": "boolean", "default": false }
-      }
-    },
-    "ConfirmProjectRequest": { "type": "object", "properties": { "project_id": { "type": "string" }, "project_name": { "type": "string" } } },
-    "UpdateAndArchiveRequest": {
-      "type": "object",
-      "required": ["title", "doc_type"],
-      "properties": {
-        "project_id":      { "type": "string" },
-        "project_name":    { "type": "string" },
-        "title":           { "type": "string" },
-        "doc_type":        { "type": "string", "enum": ["scene","chapter","concept","character","artifact","location"] },
-        "update_body_md":  { "type": "string" },
-        "merge_strategy":  { "type": "string", "enum": ["replace","append"], "default": "append" },
-        "canonical_doc_id":{ "type": "string" },
-        "strategy":        { "type": "string", "enum": ["newest","oldest","explicit"], "default": "newest" },
-        "add_banner":      { "type": "boolean", "default": false }
-      }
-    }
 }
-  }
-})
-})
+app.use(camelCaseAliasShim);
 
-// ---- Start ----
-const PORT = process.env.PORT || 8787
-app.listen(PORT, () => console.log(`API running on :${PORT}`))
+// 04. Project Routes
+// ---------------------------------------------------------------
+app.post('/projects', (req, res) => {
+  const { name, kind = 'book', parent_id = null } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'name required' });
+  if (findProjectByName(name)) return res.status(409).json({ error: 'name already exists' });
+  const id = nanoid();
+  const now = new Date().toISOString();
+  const proj = { id, name, slug: makeSlug(name), kind, parent_id, confirmed: false, require_confirmation: true, blocked: false, created_at: now, updated_at: now };
+  db.projects.set(id, proj);
+  res.json(proj);
+});
+
+app.get('/projects', (req, res) => {
+  const { q } = req.query;
+  let items = Array.from(db.projects.values()).filter(p => !p.deleted_at);
+  if (q) {
+    const qlc = String(q).toLowerCase();
+    items = items.filter(p => p.name.toLowerCase().includes(qlc) || p.slug.includes(makeSlug(q)));
+  }
+  res.json(items);
+});
+
+app.get('/projects/find', (req, res) => {
+  const { name, slug } = req.query;
+  const proj = name ? findProjectByName(name) : slug ? findProjectBySlug(slug) : null;
+  if (!proj || proj.deleted_at) return res.status(404).json({ error: 'not found' });
+  res.json(proj);
+});
+
+app.post('/projects/:id/confirm', (req, res) => {
+  const proj = db.projects.get(req.params.id);
+  if (!proj || proj.deleted_at) return res.status(404).json({ error: 'not found' });
+  proj.confirmed = true; proj.require_confirmation = false; proj.blocked = false;
+  proj.updated_at = new Date().toISOString();
+  res.json({ ok: true, project: proj });
+});
+
+app.post('/projects/confirm', (req, res) => {
+  const { name, slug } = req.body || {};
+  const proj = name ? findProjectByName(name) : slug ? findProjectBySlug(slug) : null;
+  if (!proj || proj.deleted_at) return res.status(404).json({ error: 'project not found' });
+  proj.confirmed = true; proj.require_confirmation = false; proj.blocked = false;
+  proj.updated_at = new Date().toISOString();
+  res.json({ ok: true, project: proj });
+});
+
+app.patch('/projects/:id', (req, res) => {
+  const proj = db.projects.get(req.params.id);
+  if (!proj || proj.deleted_at) return res.status(404).json({ error: 'not found' });
+  const { name, kind, parent_id, confirmed, require_confirmation, blocked } = req.body || {};
+  if (name) { proj.name = name; proj.slug = makeSlug(name); }
+  if (kind) proj.kind = kind;
+  if (typeof parent_id !== 'undefined') proj.parent_id = parent_id;
+  if (typeof confirmed !== 'undefined') proj.confirmed = !!confirmed;
+  if (typeof require_confirmation !== 'undefined') proj.require_confirmation = !!require_confirmation;
+  if (typeof blocked !== 'undefined') proj.blocked = !!blocked;
+  proj.updated_at = new Date().toISOString();
+  res.json(proj);
+});
+
+app.post('/projects/set-default', (req, res) => {
+  const { name, id } = req.body || {};
+  let proj = null;
+  if (id) proj = db.projects.get(id);
+  else if (name) proj = findProjectByName(name);
+  if (!proj || proj.deleted_at) return res.status(404).json({ error: 'project not found' });
+  DEFAULT_PROJECT_ID = proj.id;
+  res.json({ ok: true, default_project_id: DEFAULT_PROJECT_ID });
+});
+
+// 05. Middlewares
+// ---------------------------------------------------------------
+function resolveProjectId(req, res, next) {
+  let { project_id, project_name } = req.body || {};
+  // Also support query param project_name for GET routes
+  if (!project_name && req.query && req.query.project_name) project_name = req.query.project_name;
+
+  const headerProjectId = req.header('x-project-id');
+  let proj = null;
+  if (project_id) proj = db.projects.get(project_id);
+  else if (project_name) proj = findProjectByName(project_name);
+  else if (headerProjectId) proj = db.projects.get(headerProjectId);
+  else if (DEFAULT_PROJECT_ID) proj = db.projects.get(DEFAULT_PROJECT_ID);
+  if (!proj || proj.deleted_at) return res.status(400).json({ error: 'project resolution failed' });
+  req.project = proj;
+  next();
+}
+
+function requireConfirmedProject(req, res, next) {
+  const p = req.project;
+  if (p.blocked) return res.status(403).json({ error: 'project is blocked' });
+  if (p.require_confirmation && !p.confirmed) {
+    if (ALLOW_AUTOCONFIRM) {
+      p.confirmed = true; p.require_confirmation = false; p.blocked = false; p.updated_at = new Date().toISOString();
+      return next();
+    }
+    return res.status(412).json({ error: 'project not confirmed', hint: 'POST /projects/confirm with {"name":"<project name>"} or /projects/:id/confirm', project: { id: p.id, name: p.name } });
+  }
+  next();
+}
+
+// Helper: parse tag params into array and apply mode
+function applyTagFilter(items, query) {
+  const tagsMode = (query.tagsMode || 'all').toLowerCase(); // 'all' or 'any'
+  // Collect tags from ?tag=... (repeatable) and/or ?tags=a,b
+  let wanted = [];
+  if (Array.isArray(query.tag)) wanted = wanted.concat(query.tag);
+  else if (query.tag) wanted.push(query.tag);
+  if (query.tags) {
+    wanted = wanted.concat(String(query.tags).split(',').map(s => s.trim()).filter(Boolean));
+  }
+  wanted = Array.from(new Set(wanted)); // unique
+
+  if (wanted.length === 0) return items;
+
+  return items.filter(d => {
+    const docTags = Array.isArray(d.tags) ? d.tags : [];
+    if (tagsMode === 'any') {
+      return wanted.some(t => docTags.includes(t));
+    } else {
+      // all
+      return wanted.every(t => docTags.includes(t));
+    }
+  });
+}
+
+// Helper: parse meta.* filters (all must match)
+function applyMetaFilter(items, query) {
+  const metaPairs = Object.entries(query)
+    .filter(([k]) => k.startsWith('meta.'))
+    .map(([k, v]) => [k.slice(5), v]);
+  if (metaPairs.length === 0) return items;
+
+  return items.filter(d => {
+    const m = d.meta || {};
+    return metaPairs.every(([mk, mv]) => String(m[mk]) === String(mv));
+  });
+}
+
+// 06. Document Routes
+// ---------------------------------------------------------------
+// Create
+app.post('/doc', resolveProjectId, requireConfirmedProject, (req, res) => {
+  const { doc_type, title, body_md = '', tags = [], meta = {} } = req.body || {};
+  if (!doc_type || !title) return res.status(400).json({ error: 'doc_type and title required' });
+  const id = nanoid();
+  const now = new Date().toISOString();
+  const doc = { id, project_id: req.project.id, doc_type, title, body_md, tags, meta, created_at: now, updated_at: now };
+  db.docs.set(id, doc);
+  res.json(mapDoc(doc));
+});
+
+// List by project with optional filters: title, doc_type, ci=true, tags, meta.*
+app.get('/doc', resolveProjectId, (req, res) => {
+  const { title, doc_type, ci = 'false' } = req.query;
+  let items = Array.from(db.docs.values()).filter(d => d.project_id === req.project.id && !d.deleted_at);
+
+  if (title) {
+    if (ci === 'true') {
+      const nt = normalizeTitle(title);
+      items = items.filter(d => normalizeTitle(d.title) === nt);
+    } else {
+      items = items.filter(d => d.title === title);
+    }
+  }
+  if (doc_type) items = items.filter(d => d.doc_type === doc_type);
+
+  items = applyTagFilter(items, req.query);
+  items = applyMetaFilter(items, req.query);
+
+  res.json(items.map(mapDoc));
+});
+
+// Read one by id
+app.get('/doc/:id', resolveProjectId, (req, res) => {
+  const doc = db.docs.get(req.params.id);
+  if (!doc || doc.project_id !== req.project.id || doc.deleted_at) return res.status(404).json({ error: 'doc not found' });
+  res.json(mapDoc(doc));
+});
+
+// Update by id (supports overwrite/append to body_md via ?append=true)
+app.patch('/doc/:id', resolveProjectId, requireConfirmedProject, (req, res) => {
+  const doc = db.docs.get(req.params.id);
+  if (!doc || doc.project_id !== req.project.id || doc.deleted_at) return res.status(404).json({ error: 'doc not found' });
+
+  const { doc_type, title, body_md, tags, meta } = req.body || {};
+  const { append = 'false' } = req.query;
+
+  if (doc_type) doc.doc_type = doc_type;
+  if (title) doc.title = title;
+  if (Array.isArray(tags)) doc.tags = tags;
+  if (meta && typeof meta === 'object') doc.meta = meta;
+  if (typeof body_md === 'string') {
+    if (append === 'true') doc.body_md = (doc.body_md || '') + '\n' + body_md;
+    else doc.body_md = body_md;
+  }
+
+  doc.updated_at = new Date().toISOString();
+  res.json(mapDoc(doc));
+});
+
+// 07. Safe Delete & Restore
+// ---------------------------------------------------------------
+app.delete('/doc/:id', (req, res) => {
+  const { id } = req.params;
+  const { purge = 'false' } = req.query;
+  const confirmTitle = req.header('x-confirm-title');
+  const doc = db.docs.get(id);
+  if (!doc) {
+    if (purge === 'true' && db.trash.docs.has(id)) { purgeDoc(id); return res.json({ ok: true, purged: true }); }
+    return res.status(404).json({ error: 'doc not found' });
+  }
+  if (confirmTitle && confirmTitle !== doc.title) return res.status(412).json({ error: 'confirmation title mismatch', expected: doc.title });
+  softDeleteDoc(doc, 'api');
+  if (purge === 'true') purgeDoc(id);
+  res.json({ ok: true, deleted: true, purged: purge === 'true' });
+});
+
+app.delete('/projects/:id', (req, res) => {
+  const { id } = req.params;
+  const { cascade = 'false', purge = 'false' } = req.query;
+  const confirmName = req.header('x-confirm-name');
+  const proj = db.projects.get(id);
+  if (!proj) {
+    if (purge === 'true' && db.trash.projects.has(id)) { purgeProject(id); return res.json({ ok: true, purged: true }); }
+    return res.status(404).json({ error: 'project not found' });
+  }
+  if (!confirmName || confirmName !== proj.name) {
+    return res.status(412).json({ error: 'confirmation required', hint: 'Send header x-confirm-name with exact project name', expected: proj.name });
+  }
+  const children = Array.from(db.docs.values()).filter(d => d.project_id === proj.id && !d.deleted_at);
+  if (children.length > 0 && cascade !== 'true') {
+    return res.status(409).json({ error: 'project has documents', count: children.length, hint: 'Retry with ?cascade=true' });
+  }
+  if (cascade === 'true') { for (const d of children) softDeleteDoc(d, 'cascade'); }
+  softDeleteProject(proj, 'api');
+  if (purge === 'true') {
+    for (const [docId, d] of db.trash.docs.entries()) if (d.project_id === proj.id) db.trash.docs.delete(docId);
+    purgeProject(id);
+  }
+  res.json({ ok: true, deleted: true, purged: purge === 'true', cascaded_docs: cascade === 'true' ? children.length : 0 });
+});
+
+app.post('/doc/:id/restore', (req, res) => {
+  const { id } = req.params;
+  const snap = db.trash.docs.get(id);
+  if (!snap) return res.status(404).json({ error: 'not found in trash' });
+  const restored = { ...snap }; delete restored.deleted_at; delete restored.deleted_by;
+  db.docs.set(id, restored); db.trash.docs.delete(id);
+  res.json({ ok: true, restored: true, doc: mapDoc(restored) });
+});
+
+app.post('/projects/:id/restore', (req, res) => {
+  const { id } = req.params;
+  const snap = db.trash.projects.get(id);
+  if (!snap) return res.status(404).json({ error: 'not found in trash' });
+  const restored = { ...snap }; delete restored.deleted_at; delete restored.deleted_by;
+  db.projects.set(id, restored); db.trash.projects.delete(id);
+  res.json({ ok: true, restored: true, project: restored });
+});
+
+// 08. Diagnostics & Health
+// ---------------------------------------------------------------
+app.get('/health', (req, res) => {
+  res.json({ ok: true, version: '2.3.0', defaults: { project_id: DEFAULT_PROJECT_ID }, toggles: { ALLOW_AUTOCONFIRM } });
+});
+
+// 09. Lyra-Facing Helper Endpoints
+// ---------------------------------------------------------------
+app.post('/lyra/paste-save', resolveProjectId, requireConfirmedProject, (req, res) => {
+  const { docMode = 'create', sceneWriteMode = 'overwrite', id, payload = {} } = req.body || {};
+  const { doc_type, title, body_md = '', tags = [], meta = {} } = payload;
+  if (!doc_type || !title) return res.status(400).json({ error: 'doc_type and title required' });
+
+  if (docMode === 'update') {
+    if (!id) return res.status(400).json({ error: 'id is required for update' });
+    const existing = db.docs.get(id);
+    if (!existing || existing.project_id !== req.project.id) return res.status(404).json({ error: 'doc not found in this project' });
+    existing.doc_type = doc_type;
+    existing.title = title;
+    existing.tags = tags;
+    existing.meta = meta;
+    if (sceneWriteMode === 'append') existing.body_md = (existing.body_md || '') + '\\n' + body_md;
+    else existing.body_md = body_md;
+    existing.updated_at = new Date().toISOString();
+    return res.json({ ok: true, mode: 'update', doc: mapDoc(existing) });
+  }
+
+  const newId = nanoid();
+  const now = new Date().toISOString();
+  const doc = { id: newId, project_id: req.project.id, doc_type, title, body_md, tags, meta, created_at: now, updated_at: now };
+  db.docs.set(newId, doc);
+  return res.json({ ok: true, mode: 'create', doc: mapDoc(doc) });
+});
+
+app.get('/lyra/read', resolveProjectId, (req, res) => {
+  const { id, title, doc_type, ci = 'false' } = req.query;
+  const metaFilters = Object.fromEntries(Object.entries(req.query).filter(([k]) => k.startsWith('meta.')).map(([k, v]) => [k.slice(5), v]));
+
+  // Build initial set
+  let candidates = Array.from(db.docs.values()).filter(d => d.project_id === req.project.id && !d.deleted_at);
+
+  // ID takes precedence
+  if (id) {
+    const doc = db.docs.get(id);
+    if (!doc || doc.project_id !== req.project.id || doc.deleted_at) return res.status(404).json({ error: 'doc not found' });
+    return res.json({ ok: true, doc: mapDoc(doc) });
+  }
+
+  // Title / type filters
+  if (title) {
+    if (ci === 'true') {
+      const nt = normalizeTitle(title);
+      candidates = candidates.filter(d => normalizeTitle(d.title) === nt);
+    } else {
+      candidates = candidates.filter(d => d.title === title);
+    }
+  }
+  if (doc_type) candidates = candidates.filter(d => d.doc_type === doc_type);
+
+  // Tags filter (same semantics as /doc)
+  candidates = applyTagFilter(candidates, req.query);
+
+  // Meta filters
+  for (const [mk, mv] of Object.entries(metaFilters)) {
+    candidates = candidates.filter(d => d.meta && String(d.meta[mk]) === String(mv));
+  }
+
+  if (candidates.length === 0) return res.status(404).json({ error: 'no matches' });
+  if (candidates.length === 1) return res.json({ ok: true, doc: mapDoc(candidates[0]) });
+  return res.json({ ok: true, docs: candidates.map(mapDoc) });
+});
+
+app.get('/lyra/read-stream', resolveProjectId, (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  const send = (event, data) => { res.write(`event: ${event}\\n`); res.write(`data: ${JSON.stringify(data)}\\n\\n`); };
+
+  const { id, title, doc_type, ci = 'false' } = req.query;
+  let candidates = Array.from(db.docs.values()).filter(d => d.project_id === req.project.id && !d.deleted_at);
+
+  if (id) {
+    const doc = db.docs.get(id);
+    if (!doc || doc.project_id !== req.project.id || doc.deleted_at) { send('error', { error: 'doc not found' }); return res.end(); }
+    candidates = [doc];
+  } else {
+    if (title) {
+      if (ci === 'true') {
+        const nt = normalizeTitle(title);
+        candidates = candidates.filter(d => normalizeTitle(d.title) === nt);
+      } else {
+        candidates = candidates.filter(d => d.title === title);
+      }
+    }
+    if (doc_type) candidates = candidates.filter(d => d.doc_type === doc_type);
+    candidates = applyTagFilter(candidates, req.query);
+    candidates = applyMetaFilter(candidates, req.query);
+  }
+
+  if (candidates.length === 0) { send('error', { error: 'no matches' }); return res.end(); }
+  const doc = candidates[0];
+  send('start', { id: doc.id, title: doc.title });
+  const text = String(doc.body_md || '');
+  const chunkSize = 256; let idx = 0;
+  const interval = setInterval(() => {
+    if (idx >= text.length) { clearInterval(interval); send('done', { bytes: text.length }); res.end(); return; }
+    const chunk = text.slice(idx, idx + chunkSize); idx += chunkSize; send('delta', { chunk });
+  }, 25);
+});
+
+app.post('/lyra/ingest', resolveProjectId, requireConfirmedProject, (req, res) => {
+  const { docs = [] } = req.body || {};
+  if (!Array.isArray(docs) || docs.length === 0) return res.status(400).json({ error: 'docs array required' });
+  const results = [];
+  for (const item of docs) {
+    const { id, doc_type, title, body_md = '', tags = [], meta = {} } = item || {};
+    if (!doc_type || !title) { results.push({ ok: false, error: 'doc_type and title required' }); continue; }
+    if (id && db.docs.has(id)) {
+      const existing = db.docs.get(id);
+      if (existing.project_id !== req.project.id) { results.push({ ok: false, error: 'doc belongs to different project', id }); continue; }
+      existing.doc_type = doc_type; existing.title = title; existing.body_md = body_md; existing.tags = tags; existing.meta = meta; existing.updated_at = new Date().toISOString();
+      results.push({ ok: true, id: existing.id, mode: 'update' });
+    } else {
+      const newId = nanoid(); const now = new Date().toISOString();
+      const doc = { id: newId, project_id: req.project.id, doc_type, title, body_md, tags, meta, created_at: now, updated_at: now };
+      db.docs.set(newId, doc);
+      results.push({ ok: true, id: newId, mode: 'create' });
+    }
+  }
+  res.json({ ok: true, count: results.length, results });
+});
+
+app.post('/lyra/command', (req, res) => {
+  const { command, args = {} } = req.body || {};
+  if (!command) return res.status(400).json({ error: 'command required' });
+  switch (command) {
+    case '/confirm-project': {
+      const { project_name, slug, id } = args;
+      let proj = null;
+      if (id) proj = db.projects.get(id);
+      else if (project_name) proj = findProjectByName(project_name);
+      else if (slug) proj = findProjectBySlug(slug);
+      if (!proj || proj.deleted_at) return res.status(404).json({ error: 'project not found' });
+      proj.confirmed = true; proj.require_confirmation = false; proj.blocked = false; proj.updated_at = new Date().toISOString();
+      return res.json({ ok: true, project: proj });
+    }
+    default:
+      return res.status(400).json({ error: 'unknown command', command });
+  }
+});
+
+app.get('/lyra/modes', (req, res) => {
+  res.json({
+    ok: true,
+    version: '2.3.0',
+    modes: {
+      read: { route: '/lyra/read', stream: '/lyra/read-stream' },
+      write: { route: '/lyra/paste-save' },
+      ingest: { route: '/lyra/ingest' },
+      commands: { route: '/lyra/command', commands: ['/confirm-project'] }
+    }
+  });
+});
+
+// 10. Server Start
+// ---------------------------------------------------------------
+app.listen(PORT, () => {
+  console.log(`Writing API v2.3.0 listening on :${PORT}`);
+});

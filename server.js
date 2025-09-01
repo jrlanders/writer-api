@@ -60,6 +60,79 @@ if (!DB_URL || !OPENAI_API_KEY) {
 const pool = new Pool({ connectionString: DB_URL, ssl: { rejectUnauthorized: false } })
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY })
 
+// ===== Outline fields (synopsis, beats, scene_text) mapper =====
+function applyOutlineFields({ doc_type, incoming = {}, current = {} }) {
+  const out = { body_md: current.body_md, meta: coerceMeta(current.meta) };
+  const has = (k) => Object.prototype.hasOwnProperty.call(incoming, k);
+  if (has('beats') && incoming.beats != null) out.meta.beats = incoming.beats;
+  if (has('synopsis') && incoming.synopsis != null) {
+    out.meta.synopsis = incoming.synopsis;
+    if (doc_type !== 'scene' && (!out.body_md || String(out.body_md).trim() === '')) {
+      out.body_md = String(incoming.synopsis);
+    }
+  }
+  if (String(doc_type) === 'scene' && has('scene_text') && incoming.scene_text != null) {
+    out.body_md = String(incoming.scene_text);
+  }
+  return out;
+}
+
+// ===== Project freshness (10-minute timeout) =====
+const PROJECT_FRESH_MS = 10 * 60 * 1000;
+let lastConfirmedProject = { project_id: null, project_name: null, ts: 0 };
+
+async function getProjectNameById(project_id) {
+  if (!project_id) return null;
+  const { rows } = await pool.query(`SELECT name FROM projects WHERE id = $1`, [project_id]);
+  return rows[0]?.name || null;
+}
+
+function markProjectFresh(pid, pname) {
+  lastConfirmedProject = { project_id: pid || null, project_name: pname || null, ts: Date.now() };
+}
+
+function isProjectFresh(pid, pname) {
+  const same = (!!pid && lastConfirmedProject.project_id === pid) ||
+               (!!pname && lastConfirmedProject.project_name &&
+                 String(lastConfirmedProject.project_name).toLowerCase().trim() === String(pname).toLowerCase().trim());
+  if (!same) return false;
+  return (Date.now() - lastConfirmedProject.ts) < PROJECT_FRESH_MS;
+}
+
+async function enforceProjectFreshness(req, res, next) {
+  try {
+    const writePaths = new Set(['/ingest','/update','/update-by-title','/lyra/paste-save','/archive-redirect','/update-and-archive']);
+    if (!writePaths.has(req.path)) return next();
+    const pid = await resolveProjectId(req.body?.project_id, req.body?.project_name);
+    const pname = req.body?.project_name || (await getProjectNameById(pid));
+    if (isProjectFresh(pid, pname)) return next();
+    return res.status(409).json({
+      error: 'project_confirmation_required',
+      message: `Confirm project: ${pname}`,
+      project_id: pid,
+      project_name: pname,
+      confirm_with: { method: 'POST', path: '/confirm-project', body: { project_id: pid, project_name: pname } },
+      freshness_timeout_ms: PROJECT_FRESH_MS
+    });
+  } catch (e) {
+    console.error('enforceProjectFreshness error', e);
+    return res.status(500).json({ error: 'freshness_check_error', details: String(e?.message || e) });
+  }
+}
+
+app.post('/confirm-project', requireAuth, async (req, res) => {
+  try {
+    const { project_id, project_name } = req.body || {};
+    const pid = await resolveProjectId(project_id, project_name);
+    const pname = project_name || (await getProjectNameById(pid));
+    markProjectFresh(pid, pname);
+    res.json({ ok: true, project_id: pid, project_name: pname, confirmed_at: Date.now(), ttl_ms: PROJECT_FRESH_MS });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+
 // Build tag / health
 const APP_BUILD = '2025-08-30-1.5.0-lyra-paste-modes'
 
@@ -369,25 +442,28 @@ Answer format (always):
 })
 
 // ---------- WRITE: save a new doc + embed (with optional meta) ----------
-app.post('/ingest', requireAuth, async (req, res) => {
+app.post('/ingest', requireAuth, enforceProjectFreshness, async (req, res) => {
   try {
-    const { project_id, project_name, doc_type, title, body_md, tags = [], meta } = req.body || {};
-    if (!doc_type || !title || !body_md) {
+    const { project_id, project_name, doc_type, title, body_md, tags = [], meta, synopsis = undefined, beats = undefined, scene_text = undefined } = req.body || {};
+    let bodyComputed = body_md;
+    const mapped = applyOutlineFields({ doc_type, incoming: { synopsis, beats, scene_text, body_md }, current: {} });
+    const metaObj = { ...coerceMeta(meta), ...('synopsis' in mapped.meta ? { synopsis: mapped.meta.synopsis } : {}), ...('beats' in mapped.meta ? { beats: mapped.meta.beats } : {}) };
+    if (!bodyComputed) bodyComputed = mapped.body_md;
+    if (!doc_type || !title || !bodyComputed) {
       return res.status(400).json({ error: 'doc_type, title, body_md required (plus project_id or project_name)' });
     }
     const pid = await resolveProjectId(project_id, project_name);
-    const metaObj = coerceMeta(meta);
 
     const insertDocSQL = `
       INSERT INTO documents (project_id, doc_type, title, body_md, tags, meta, created_at, updated_at)
       VALUES ($1,$2,$3,$4,$5,$6, now(), now())
       RETURNING id
     `;
-    const { rows } = await pool.query(insertDocSQL, [pid, doc_type, title, body_md, tags, JSON.stringify(metaObj)]);
+    const { rows } = await pool.query(insertDocSQL, [pid, doc_type, title, bodyComputed, tags, JSON.stringify(metaObj)]);
     const doc_id = rows[0].id;
 
-    const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
-    const chunks = paragraphs.length ? paragraphs : [body_md];
+    const paragraphs = bodyComputed.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+    const chunks = paragraphs.length ? paragraphs : [bodyComputed];
 
     for (let i = 0; i < chunks.length; i += 16) {
       const batch = chunks.slice(i, i + 16);
@@ -634,7 +710,7 @@ async function upsertDocumentByTitle({ projectId, title, body_md, doc_type='scen
 // Added mode flags:
 //   sceneWriteMode: 'overwrite' | 'append' | 'auto'   (default 'auto': split; first chunk overwrites, rest append)
 //   docMode:        'upsert' | 'create' | 'update'    (default 'upsert')
-app.post('/lyra/paste-save', requireAuth, async (req, res) => {
+app.post('/lyra/paste-save', requireAuth, enforceProjectFreshness, async (req, res) => {
   try {
     const {
       project_id,
@@ -797,22 +873,28 @@ Answer format (always):
 });
 
 // ---------- UPDATE / RE-EMBED ----------
-app.post('/update', requireAuth, async (req, res) => {
+app.post('/update', requireAuth, enforceProjectFreshness, async (req, res) => {
   try {
-    const { document_id, project_id, project_name, title, body_md, tags, meta } = req.body || {};
+    const { document_id, project_id, project_name, title, body_md, tags, meta, synopsis = undefined, beats = undefined, scene_text = undefined } = req.body || {};
     if (!document_id || (!title && !body_md && !tags && !meta)) {
       return res.status(400).json({ error: 'document_id and one of title/body_md/tags/meta required (plus project_id or project_name)' });
     }
     const pid = await resolveProjectId(project_id, project_name);
+
+    const curQ = await pool.query(`SELECT title, doc_type, body_md, meta, tags FROM documents WHERE id = $1`, [document_id]);
+    if (!curQ.rows.length) return res.status(404).json({ error: 'Document not found' });
+    const current = curQ.rows[0];
+    const mapped = applyOutlineFields({ doc_type: current.doc_type, incoming: { synopsis, beats, scene_text, body_md }, current });
+    const metaObj = { ...coerceMeta(current.meta), ...coerceMeta(meta), ...('synopsis' in mapped.meta ? { synopsis: mapped.meta.synopsis } : {}), ...('beats' in mapped.meta ? { beats: mapped.meta.beats } : {}) };
 
     const sets = [];
     const vals = [];
     let idx = 1;
 
     if (title)   { sets.push(`title = $${idx++}`);        vals.push(title); }
-    if (body_md) { sets.push(`body_md = $${idx++}`);      vals.push(body_md); }
+    if (mapped.body_md && mapped.body_md !== current.body_md) { sets.push(`body_md = $${idx++}`); vals.push(mapped.body_md); }
     if (tags)    { sets.push(`tags = $${idx++}`);         vals.push(tags); }
-    if (meta)    { sets.push(`meta = $${idx++}::jsonb`);  vals.push(JSON.stringify(coerceMeta(meta))); }
+    if (meta || 'synopsis' in mapped.meta || 'beats' in mapped.meta) { sets.push(`meta = $${idx++}::jsonb`);  vals.push(JSON.stringify(coerceMeta(metaObj))); }
 
     sets.push(`updated_at = now()`);
     vals.push(pid, document_id);
@@ -823,7 +905,7 @@ app.post('/update', requireAuth, async (req, res) => {
     );
     if (rowCount === 0) return res.status(404).json({ error: 'Document not found for this project' });
 
-    if (body_md) {
+    if (mapped.body_md && mapped.body_md !== current.body_md) {
       await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id]);
 
       const docQ = await pool.query(
@@ -835,8 +917,8 @@ app.post('/update', requireAuth, async (req, res) => {
       const embDocType = current.doc_type || 'update';
       const embMetaBase = coerceMeta(meta ?? current.meta);
 
-      const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
-      const chunks = paragraphs.length ? paragraphs : [body_md];
+      const paragraphs = mapped.body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+      const chunks = paragraphs.length ? paragraphs : [mapped.body_md];
 
       for (let i = 0; i < chunks.length; i += 16) {
         const batch = chunks.slice(i, i + 16);
@@ -860,9 +942,9 @@ app.post('/update', requireAuth, async (req, res) => {
 })
 
 // ---------- UPDATE BY TITLE ----------
-app.post('/update-by-title', requireAuth, async (req, res) => {
+app.post('/update-by-title', requireAuth, enforceProjectFreshness, async (req, res) => {
   try {
-    const { project_id, project_name, title, body_md, tags, meta } = req.body || {};
+    const { project_id, project_name, title, body_md, tags, meta, synopsis = undefined, beats = undefined, scene_text = undefined } = req.body || {};
     if (!title || (!body_md && !tags && !meta)) {
       return res.status(400).json({ error: 'title and one of body_md/tags/meta required (plus project_id or project_name)' });
     }
@@ -876,13 +958,18 @@ app.post('/update-by-title', requireAuth, async (req, res) => {
 
     const document_id = found.rows[0].id;
 
+    const curQ2 = await pool.query(`SELECT title, doc_type, body_md, meta, tags FROM documents WHERE id = $1`, [document_id]);
+    const current2 = curQ2.rows[0];
+    const mapped2 = applyOutlineFields({ doc_type: current2.doc_type, incoming: { synopsis, beats, scene_text, body_md }, current: current2 });
+    const metaObj2 = { ...coerceMeta(current2.meta), ...coerceMeta(meta), ...('synopsis' in mapped2.meta ? { synopsis: mapped2.meta.synopsis } : {}), ...('beats' in mapped2.meta ? { beats: mapped2.meta.beats } : {}) };
+
     const sets = [];
     const vals = [];
     let idx = 1;
 
-    if (body_md) { sets.push(`body_md = $${idx++}`);      vals.push(body_md); }
+    if (mapped.body_md && mapped.body_md !== current.body_md) { sets.push(`body_md = $${idx++}`); vals.push(mapped.body_md); }
     if (tags)    { sets.push(`tags = $${idx++}`);         vals.push(tags); }
-    if (meta)    { sets.push(`meta = $${idx++}::jsonb`);  vals.push(JSON.stringify(coerceMeta(meta))); }
+    if (meta || 'synopsis' in mapped.meta || 'beats' in mapped.meta) { sets.push(`meta = $${idx++}::jsonb`);  vals.push(JSON.stringify(coerceMeta(metaObj))); }
 
     sets.push(`updated_at = now()`);
     vals.push(pid, document_id);
@@ -892,7 +979,7 @@ app.post('/update-by-title', requireAuth, async (req, res) => {
       vals
     );
 
-    if (body_md) {
+    if (mapped.body_md && mapped.body_md !== current.body_md) {
       await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id]);
 
       const docQ = await pool.query(
@@ -904,8 +991,8 @@ app.post('/update-by-title', requireAuth, async (req, res) => {
       const embDocType = current.doc_type || 'update';
       const embMetaBase = coerceMeta(meta ?? current.meta);
 
-      const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
-      const chunks = paragraphs.length ? paragraphs : [body_md];
+      const paragraphs = mapped.body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+      const chunks = paragraphs.length ? paragraphs : [mapped.body_md];
 
       for (let i = 0; i < chunks.length; i += 16) {
         const batch = chunks.slice(i, i + 16);
@@ -1073,7 +1160,7 @@ async function _updateDocDirect({ project_id, document_id, title, body_md, tags,
   let idx = 1;
 
   if (title)   { sets.push(`title = $\${idx++}`);        vals.push(title); }
-  if (body_md) { sets.push(`body_md = $\${idx++}`);      vals.push(body_md); }
+  if (mapped.body_md && mapped.body_md !== current.body_md) { sets.push(`body_md = $\${idx++}`);      vals.push(body_md); }
   if (tags)    { sets.push(`tags = $\${idx++}`);         vals.push(tags); }
   if (meta)    { sets.push(`meta = $\${idx++}::jsonb`);  vals.push(JSON.stringify(coerceMeta(meta))); }
 
@@ -1086,7 +1173,7 @@ async function _updateDocDirect({ project_id, document_id, title, body_md, tags,
   );
   if (rowCount === 0) throw new Error('Document not found for this project');
 
-  if (body_md) {
+  if (mapped.body_md && mapped.body_md !== current.body_md) {
     await pool.query(`DELETE FROM embeddings WHERE document_id = $1`, [document_id]);
 
     const docQ = await pool.query(`SELECT title, doc_type, meta FROM documents WHERE id = $1`, [document_id]);
@@ -1095,8 +1182,8 @@ async function _updateDocDirect({ project_id, document_id, title, body_md, tags,
     const embDocType = current.doc_type || 'update';
     const embMetaBase = coerceMeta(meta ?? current.meta);
 
-    const paragraphs = body_md.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
-    const chunks = paragraphs.length ? paragraphs : [body_md];
+    const paragraphs = bodyComputed.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+    const chunks = paragraphs.length ? paragraphs : [bodyComputed];
 
     for (let i = 0; i < chunks.length; i += 16) {
       const batch = chunks.slice(i, i + 16);
@@ -1115,7 +1202,7 @@ async function _updateDocDirect({ project_id, document_id, title, body_md, tags,
 }
 
 // Archive duplicates and redirect to canonical
-app.post('/archive-redirect', requireAuth, async (req, res) => {
+app.post('/archive-redirect', requireAuth, enforceProjectFreshness, async (req, res) => {
   try {
     const {
       project_id, project_name,
@@ -1180,7 +1267,7 @@ app.post('/archive-redirect', requireAuth, async (req, res) => {
 });
 
 // Update/append canonical body_md then archive & redirect duplicates
-app.post('/update-and-archive', requireAuth, async (req, res) => {
+app.post('/update-and-archive', requireAuth, enforceProjectFreshness, async (req, res) => {
   try {
     const {
       project_id, project_name,
@@ -1387,7 +1474,7 @@ app.get('/openapi.json', (_req, res) => {
                   "tags":         { "type": "array", "items": { "type": "string" } },
                   "meta":         { "type": "object", "additionalProperties": true }
                 },
-                "required": ["doc_type","title","body_md"],
+                "required": ["doc_type","title"],
                 "oneOf": [
                   { "required": ["project_id"] },
                   { "required": ["project_name"] }
@@ -1558,6 +1645,16 @@ app.get('/openapi.json', (_req, res) => {
       }
     },
 
+    "/confirm-project": {
+      "post": {
+        "summary": "Confirm/refresh the active project for the current user",
+        "operationId": "confirmProject",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConfirmProjectRequest" } } } },
+        "responses": { "200": { "description": "OK" }, "409": { "description": "Project confirmation required" } }
+      }
+    },
+
     "/project": {
       "post": {
         "operationId": "createOrGetProject",
@@ -1637,6 +1734,7 @@ app.get('/openapi.json', (_req, res) => {
         "add_banner":      { "type": "boolean", "default": false }
       }
     },
+    "ConfirmProjectRequest": { "type": "object", "properties": { "project_id": { "type": "string" }, "project_name": { "type": "string" } } },
     "UpdateAndArchiveRequest": {
       "type": "object",
       "required": ["title", "doc_type"],

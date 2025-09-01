@@ -1,28 +1,76 @@
 /**
- * server.mjs — Writing API — v2.3.0 (ESM build)
+ * server.mjs — Writing API — v2.4.0 (ESM build)
  * ---------------------------------------------------------------
- * This is the ES Module equivalent of server.2.3.0.js.
- * Use this when your package.json has `"type": "module"` or when
- * deploying to environments that require ESM (e.g., Node 20+ with ESM).
+ * Change log (since 2.3.0):
+ * - Removed external dependency on `nanoid`; now uses `crypto.randomUUID()`
+ *   with a safe fallback. This fixes ERR_MODULE_NOT_FOUND on Render when
+ *   nanoid isn't installed.
+ * - Added env-driven CORS allowlist via CORS_ORIGIN (comma-separated).
+ * - Minor health payload tweaks; otherwise behavior is the same.
+ *
+ * Deployment notes:
+ * - File is pure ESM. Ensure package.json has: { "type": "module" }
+ * - Start with: node server.mjs  (Node 18+ recommended)
  */
 
 import express from 'express';
 import cors from 'cors';
-import { nanoid } from 'nanoid';
+import crypto from 'node:crypto';
 
 const app = express();
 
+// ---------- Config ----------
+const PORT = process.env.PORT || 3000;
+const ALLOW_AUTOCONFIRM = process.env.ALLOW_AUTOCONFIRM === '1';
+// Comma-separated list, e.g. "http://localhost:3000,https://myapp.com,*"
+const CORS_ORIGIN = (process.env.CORS_ORIGIN || 'http://localhost:3000,*')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// ---------- Utilities ----------
+// ID generator w/ randomUUID and safe fallback
+const genId = () => (typeof crypto.randomUUID === 'function'
+  ? crypto.randomUUID()
+  : Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2));
+
+const makeSlug = (s) => String(s || '').toLowerCase().trim().replace(/\s+/g, '-');
+const normalizeTitle = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+// ---------- Middleware ----------
 // Larger payload limits for long scenes/chapters
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// CORS (tighten in production)
-app.use(cors({ origin: ['http://localhost:3000', '*'] }));
+// CORS — allow from CORS_ORIGIN list or '*'
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true); // non-browser / same-origin
+    if (CORS_ORIGIN.includes('*') || CORS_ORIGIN.includes(origin)) return cb(null, true);
+    return cb(null, false);
+  },
+  credentials: true,
+}));
 
-const PORT = process.env.PORT || 3000;
-const ALLOW_AUTOCONFIRM = process.env.ALLOW_AUTOCONFIRM === '1';
+// CamelCase alias shim middleware (compat with older clients)
+function camelCaseAliasShim(req, _res, next) {
+  if (req.body && typeof req.body === 'object') {
+    const b = req.body;
+    if (!b.project_name && b.projectName) b.project_name = b.projectName;
+    if (!b.project_id && b.projectId) b.project_id = b.projectId;
+    if (b.payload && typeof b.payload === 'object') {
+      const p = b.payload;
+      if (!p.doc_type && p.docType) p.doc_type = p.docType;
+      if (!p.body_md && p.bodyMd) p.body_md = p.bodyMd;
+    }
+    if (!b.docMode && b.mode) b.docMode = b.mode;
+    if (!b.sceneWriteMode && b.writeMode) b.sceneWriteMode = b.writeMode;
+  }
+  next();
+}
+app.use(camelCaseAliasShim);
 
-// In-memory data (swap with your DB layer)
+// ---------- In-memory data (swap with your DB layer) ----------
 const db = {
   projects: new Map(),
   docs: new Map(),
@@ -30,10 +78,7 @@ const db = {
 };
 let DEFAULT_PROJECT_ID = null;
 
-// Utils
-const makeSlug = (s) => String(s || '').toLowerCase().trim().replace(/\s+/g, '-');
-const normalizeTitle = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
-
+// ---------- Helpers ----------
 const findProjectByName = (name) => {
   if (!name) return null;
   for (const p of db.projects.values()) if (p.name === name) return p;
@@ -80,32 +125,18 @@ function mapDoc(row) {
   };
 }
 
-// CamelCase alias shim middleware
-function camelCaseAliasShim(req, _res, next) {
-  if (req.body && typeof req.body === 'object') {
-    const b = req.body;
-    if (!b.project_name && b.projectName) b.project_name = b.projectName;
-    if (!b.project_id && b.projectId) b.project_id = b.projectId;
-    if (b.payload && typeof b.payload === 'object') {
-      const p = b.payload;
-      if (!p.doc_type && p.docType) p.doc_type = p.docType;
-      if (!p.body_md && p.bodyMd) p.body_md = p.bodyMd;
-    }
-    if (!b.docMode && b.mode) b.docMode = b.mode;
-    if (!b.sceneWriteMode && b.writeMode) b.sceneWriteMode = b.writeMode;
-  }
-  next();
-}
-app.use(camelCaseAliasShim);
-
-// Project routes
+// ---------- Project routes ----------
 app.post('/projects', (req, res) => {
   const { name, kind = 'book', parent_id = null } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
   if (findProjectByName(name)) return res.status(409).json({ error: 'name already exists' });
-  const id = nanoid();
+  const id = genId();
   const now = new Date().toISOString();
-  const proj = { id, name, slug: makeSlug(name), kind, parent_id, confirmed: false, require_confirmation: true, blocked: false, created_at: now, updated_at: now };
+  const proj = {
+    id, name, slug: makeSlug(name), kind, parent_id,
+    confirmed: false, require_confirmation: true, blocked: false,
+    created_at: now, updated_at: now
+  };
   db.projects.set(id, proj);
   res.json(proj);
 });
@@ -168,7 +199,7 @@ app.post('/projects/set-default', (req, res) => {
   res.json({ ok: true, default_project_id: DEFAULT_PROJECT_ID });
 });
 
-// Middlewares
+// ---------- Middlewares ----------
 function resolveProjectId(req, res, next) {
   let { project_id, project_name } = req.body || {};
   if (!project_name && req.query && req.query.project_name) project_name = req.query.project_name;
@@ -191,7 +222,11 @@ function requireConfirmedProject(req, res, next) {
       p.confirmed = true; p.require_confirmation = false; p.blocked = false; p.updated_at = new Date().toISOString();
       return next();
     }
-    return res.status(412).json({ error: 'project not confirmed', hint: 'POST /projects/confirm with {\"name\":\"<project name>\"} or /projects/:id/confirm', project: { id: p.id, name: p.name } });
+    return res.status(412).json({
+      error: 'project not confirmed',
+      hint: 'POST /projects/confirm with {"name":"<project name>"} or /projects/:id/confirm',
+      project: { id: p.id, name: p.name }
+    });
   }
   next();
 }
@@ -222,11 +257,11 @@ function applyMetaFilter(items, query) {
   });
 }
 
-// Document routes
+// ---------- Document routes ----------
 app.post('/doc', resolveProjectId, requireConfirmedProject, (req, res) => {
   const { doc_type, title, body_md = '', tags = [], meta = {} } = req.body || {};
   if (!doc_type || !title) return res.status(400).json({ error: 'doc_type and title required' });
-  const id = nanoid();
+  const id = genId();
   const now = new Date().toISOString();
   const doc = { id, project_id: req.project.id, doc_type, title, body_md, tags, meta, created_at: now, updated_at: now };
   db.docs.set(id, doc);
@@ -332,12 +367,18 @@ app.post('/projects/:id/restore', (req, res) => {
   res.json({ ok: true, restored: true, project: restored });
 });
 
-// Health
+// ---------- Health ----------
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, version: '2.3.0', defaults: { project_id: DEFAULT_PROJECT_ID }, toggles: { ALLOW_AUTOCONFIRM } });
+  res.json({
+    ok: true,
+    version: '2.4.0',
+    defaults: { project_id: DEFAULT_PROJECT_ID },
+    toggles: { ALLOW_AUTOCONFIRM },
+    cors_origin: CORS_ORIGIN
+  });
 });
 
-// Lyra helpers
+// ---------- Lyra helpers ----------
 app.post('/lyra/paste-save', resolveProjectId, requireConfirmedProject, (req, res) => {
   const { docMode = 'create', sceneWriteMode = 'overwrite', id, payload = {} } = req.body || {};
   const { doc_type, title, body_md = '', tags = [], meta = {} } = payload;
@@ -357,7 +398,7 @@ app.post('/lyra/paste-save', resolveProjectId, requireConfirmedProject, (req, re
     return res.json({ ok: true, mode: 'update', doc: mapDoc(existing) });
   }
 
-  const newId = nanoid();
+  const newId = genId();
   const now = new Date().toISOString();
   const doc = { id: newId, project_id: req.project.id, doc_type, title, body_md, tags, meta, created_at: now, updated_at: now };
   db.docs.set(newId, doc);
@@ -447,7 +488,7 @@ app.post('/lyra/ingest', resolveProjectId, requireConfirmedProject, (req, res) =
       existing.doc_type = doc_type; existing.title = title; existing.body_md = body_md; existing.tags = tags; existing.meta = meta; existing.updated_at = new Date().toISOString();
       results.push({ ok: true, id: existing.id, mode: 'update' });
     } else {
-      const newId = nanoid(); const now = new Date().toISOString();
+      const newId = genId(); const now = new Date().toISOString();
       const doc = { id: newId, project_id: req.project.id, doc_type, title, body_md, tags, meta, created_at: now, updated_at: now };
       db.docs.set(newId, doc);
       results.push({ ok: true, id: newId, mode: 'create' });
@@ -478,7 +519,7 @@ app.post('/lyra/command', (req, res) => {
 app.get('/lyra/modes', (_req, res) => {
   res.json({
     ok: true,
-    version: '2.3.0',
+    version: '2.4.0',
     modes: {
       read: { route: '/lyra/read', stream: '/lyra/read-stream' },
       write: { route: '/lyra/paste-save' },
@@ -488,7 +529,7 @@ app.get('/lyra/modes', (_req, res) => {
   });
 });
 
-// Start server
+// ---------- Start ----------
 app.listen(PORT, () => {
-  console.log(`Writing API v2.3.0 (ESM) listening on :${PORT}`);
+  console.log(`Writing API v2.4.0 (ESM) listening on :${PORT}`);
 });

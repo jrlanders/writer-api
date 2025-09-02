@@ -1,535 +1,222 @@
 /**
- * server.mjs — Writing API — v2.4.0 (ESM build)
- * ---------------------------------------------------------------
- * Change log (since 2.3.0):
- * - Removed external dependency on `nanoid`; now uses `crypto.randomUUID()`
- *   with a safe fallback. This fixes ERR_MODULE_NOT_FOUND on Render when
- *   nanoid isn't installed.
- * - Added env-driven CORS allowlist via CORS_ORIGIN (comma-separated).
- * - Minor health payload tweaks; otherwise behavior is the same.
- *
- * Deployment notes:
- * - File is pure ESM. Ensure package.json has: { "type": "module" }
- * - Start with: node server.mjs  (Node 18+ recommended)
+ * server.pg.2.5.0.mjs — Writing API with Postgres persistence
  */
 
 import express from 'express';
 import cors from 'cors';
 import crypto from 'node:crypto';
+import db from './db.pg.mjs';
 
 const app = express();
-
-// ---------- Config ----------
 const PORT = process.env.PORT || 3000;
 const ALLOW_AUTOCONFIRM = process.env.ALLOW_AUTOCONFIRM === '1';
-// Comma-separated list, e.g. "http://localhost:3000,https://myapp.com,*"
 const CORS_ORIGIN = (process.env.CORS_ORIGIN || 'http://localhost:3000,*')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+  .split(',').map(s => s.trim()).filter(Boolean);
 
-// ---------- Utilities ----------
-// ID generator w/ randomUUID and safe fallback
-const genId = () => (typeof crypto.randomUUID === 'function'
-  ? crypto.randomUUID()
-  : Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2));
+const genId = () => crypto.randomUUID();
 
-const makeSlug = (s) => String(s || '').toLowerCase().trim().replace(/\s+/g, '-');
-const normalizeTitle = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
-
-// ---------- Middleware ----------
-// Larger payload limits for long scenes/chapters
+// Middleware
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-// CORS — allow from CORS_ORIGIN list or '*'
 app.use(cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // non-browser / same-origin
+    if (!origin) return cb(null, true);
     if (CORS_ORIGIN.includes('*') || CORS_ORIGIN.includes(origin)) return cb(null, true);
     return cb(null, false);
   },
   credentials: true,
 }));
 
-// CamelCase alias shim middleware (compat with older clients)
-function camelCaseAliasShim(req, _res, next) {
-  if (req.body && typeof req.body === 'object') {
-    const b = req.body;
-    if (!b.project_name && b.projectName) b.project_name = b.projectName;
-    if (!b.project_id && b.projectId) b.project_id = b.projectId;
-    if (b.payload && typeof b.payload === 'object') {
-      const p = b.payload;
-      if (!p.doc_type && p.docType) p.doc_type = p.docType;
-      if (!p.body_md && p.bodyMd) p.body_md = p.bodyMd;
-    }
-    if (!b.docMode && b.mode) b.docMode = b.mode;
-    if (!b.sceneWriteMode && b.writeMode) b.sceneWriteMode = b.writeMode;
-  }
-  next();
-}
-app.use(camelCaseAliasShim);
-
-// ---------- In-memory data (swap with your DB layer) ----------
-const db = {
-  projects: new Map(),
-  docs: new Map(),
-  trash: { projects: new Map(), docs: new Map() },
-};
-let DEFAULT_PROJECT_ID = null;
-
-// ---------- Helpers ----------
-const findProjectByName = (name) => {
-  if (!name) return null;
-  for (const p of db.projects.values()) if (p.name === name) return p;
-  return null;
-};
-const findProjectBySlug = (slug) => {
-  if (!slug) return null;
-  for (const p of db.projects.values()) if (p.slug === slug) return p;
-  return null;
-};
-
-function softDeleteProject(proj, who = 'system') {
-  if (!proj.deleted_at) {
-    proj.deleted_at = new Date().toISOString();
-    proj.deleted_by = who;
-  }
-  db.trash.projects.set(proj.id, { ...proj });
-}
-function softDeleteDoc(doc, who = 'system') {
-  if (!doc.deleted_at) {
-    doc.deleted_at = new Date().toISOString();
-    doc.deleted_by = who;
-  }
-  db.trash.docs.set(doc.id, { ...doc });
-}
-function purgeProject(id) {
-  db.trash.projects.delete(id);
-  db.projects.delete(id);
-}
-function purgeDoc(id) {
-  db.trash.docs.delete(id);
-  db.docs.delete(id);
-}
-
-function mapDoc(row) {
-  if (!row) return null;
-  const {
-    id, project_id, doc_type, title, body_md, tags, meta,
-    created_at, updated_at, deleted_at
-  } = row;
-  return {
-    id, project_id, doc_type, title, body_md, tags, meta, created_at, updated_at,
-    deleted: !!deleted_at
-  };
-}
-
-// ---------- Project routes ----------
-app.post('/projects', (req, res) => {
-  const { name, kind = 'book', parent_id = null } = req.body || {};
+// Projects
+app.post('/projects', async (req, res) => {
+  const { name, kind = 'book' } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
-  if (findProjectByName(name)) return res.status(409).json({ error: 'name already exists' });
-  const id = genId();
-  const now = new Date().toISOString();
-  const proj = {
-    id, name, slug: makeSlug(name), kind, parent_id,
-    confirmed: false, require_confirmation: true, blocked: false,
-    created_at: now, updated_at: now
-  };
-  db.projects.set(id, proj);
+  const existing = await db.findProjectByName(name);
+  if (existing) return res.status(409).json({ error: 'name already exists', id: existing.id });
+  const proj = await db.createProject({ id: genId(), name, slug: name.toLowerCase().replace(/\s+/g,'-'), kind });
   res.json(proj);
 });
 
-app.get('/projects', (req, res) => {
-  const { q } = req.query;
-  let items = Array.from(db.projects.values()).filter(p => !p.deleted_at);
-  if (q) {
-    const qlc = String(q).toLowerCase();
-    items = items.filter(p => p.name.toLowerCase().includes(qlc) || p.slug.includes(makeSlug(q)));
-  }
-  res.json(items);
+app.get('/projects', async (_req, res) => {
+  res.json(await db.listProjects());
 });
 
-app.get('/projects/find', (req, res) => {
-  const { name, slug } = req.query;
-  const proj = name ? findProjectByName(name) : slug ? findProjectBySlug(slug) : null;
-  if (!proj || proj.deleted_at) return res.status(404).json({ error: 'not found' });
-  res.json(proj);
+app.post('/projects/confirm', async (req, res) => {
+  const { name } = req.body || {};
+  const proj = await db.findProjectByName(name);
+  if (!proj) return res.status(404).json({ error: 'not found' });
+  const confirmed = await db.confirmProject(proj.id);
+  res.json({ ok: true, project: confirmed });
 });
 
-app.post('/projects/:id/confirm', (req, res) => {
-  const proj = db.projects.get(req.params.id);
-  if (!proj || proj.deleted_at) return res.status(404).json({ error: 'not found' });
-  proj.confirmed = true; proj.require_confirmation = false; proj.blocked = false;
-  proj.updated_at = new Date().toISOString();
-  res.json({ ok: true, project: proj });
+// Docs
+app.post('/doc', async (req, res) => {
+  const { project_name, doc_type, title, body_md, tags, meta } = req.body;
+  const proj = await db.findProjectByName(project_name);
+  if (!proj) return res.status(404).json({ error: 'project not found' });
+  if (proj.require_confirmation && !proj.confirmed && !ALLOW_AUTOCONFIRM)
+    return res.status(412).json({ error: 'project not confirmed' });
+  const doc = await db.createDoc({ id: genId(), project_id: proj.id, doc_type, title, body_md, tags, meta });
+  res.json(doc);
 });
 
-app.post('/projects/confirm', (req, res) => {
-  const { name, slug } = req.body || {};
-  const proj = name ? findProjectByName(name) : slug ? findProjectBySlug(slug) : null;
-  if (!proj || proj.deleted_at) return res.status(404).json({ error: 'project not found' });
-  proj.confirmed = true; proj.require_confirmation = false; proj.blocked = false;
-  proj.updated_at = new Date().toISOString();
-  res.json({ ok: true, project: proj });
+app.get('/doc', async (req, res) => {
+  const { project_name } = req.query;
+  const proj = await db.findProjectByName(project_name);
+  if (!proj) return res.status(404).json({ error: 'project not found' });
+  const docs = await db.listDocs({ project_id: proj.id });
+  res.json(docs);
 });
 
-app.patch('/projects/:id', (req, res) => {
-  const proj = db.projects.get(req.params.id);
-  if (!proj || proj.deleted_at) return res.status(404).json({ error: 'not found' });
-  const { name, kind, parent_id, confirmed, require_confirmation, blocked } = req.body || {};
-  if (name) { proj.name = name; proj.slug = makeSlug(name); }
-  if (kind) proj.kind = kind;
-  if (typeof parent_id !== 'undefined') proj.parent_id = parent_id;
-  if (typeof confirmed !== 'undefined') proj.confirmed = !!confirmed;
-  if (typeof require_confirmation !== 'undefined') proj.require_confirmation = !!require_confirmation;
-  if (typeof blocked !== 'undefined') proj.blocked = !!blocked;
-  proj.updated_at = new Date().toISOString();
-  res.json(proj);
-});
-
-app.post('/projects/set-default', (req, res) => {
-  const { name, id } = req.body || {};
-  let proj = null;
-  if (id) proj = db.projects.get(id);
-  else if (name) proj = findProjectByName(name);
-  if (!proj || proj.deleted_at) return res.status(404).json({ error: 'project not found' });
-  DEFAULT_PROJECT_ID = proj.id;
-  res.json({ ok: true, default_project_id: DEFAULT_PROJECT_ID });
-});
-
-// ---------- Middlewares ----------
-function resolveProjectId(req, res, next) {
-  let { project_id, project_name } = req.body || {};
-  if (!project_name && req.query && req.query.project_name) project_name = req.query.project_name;
-  const headerProjectId = req.header('x-project-id');
-  let proj = null;
-  if (project_id) proj = db.projects.get(project_id);
-  else if (project_name) proj = findProjectByName(project_name);
-  else if (headerProjectId) proj = db.projects.get(headerProjectId);
-  else if (DEFAULT_PROJECT_ID) proj = db.projects.get(DEFAULT_PROJECT_ID);
-  if (!proj || proj.deleted_at) return res.status(400).json({ error: 'project resolution failed' });
-  req.project = proj;
-  next();
-}
-
-function requireConfirmedProject(req, res, next) {
-  const p = req.project;
-  if (p.blocked) return res.status(403).json({ error: 'project is blocked' });
-  if (p.require_confirmation && !p.confirmed) {
-    if (ALLOW_AUTOCONFIRM) {
-      p.confirmed = true; p.require_confirmation = false; p.blocked = false; p.updated_at = new Date().toISOString();
-      return next();
-    }
-    return res.status(412).json({
-      error: 'project not confirmed',
-      hint: 'POST /projects/confirm with {"name":"<project name>"} or /projects/:id/confirm',
-      project: { id: p.id, name: p.name }
-    });
-  }
-  next();
-}
-
-// Tag & meta filters
-function applyTagFilter(items, query) {
-  const tagsMode = (query.tagsMode || 'all').toLowerCase();
-  let wanted = [];
-  if (Array.isArray(query.tag)) wanted = wanted.concat(query.tag);
-  else if (query.tag) wanted.push(query.tag);
-  if (query.tags) {
-    wanted = wanted.concat(String(query.tags).split(',').map(s => s.trim()).filter(Boolean));
-  }
-  wanted = Array.from(new Set(wanted));
-  if (wanted.length === 0) return items;
-  return items.filter(d => {
-    const docTags = Array.isArray(d.tags) ? d.tags : [];
-    if (tagsMode === 'any') return wanted.some(t => docTags.includes(t));
-    return wanted.every(t => docTags.includes(t));
-  });
-}
-function applyMetaFilter(items, query) {
-  const metaPairs = Object.entries(query).filter(([k]) => k.startsWith('meta.')).map(([k, v]) => [k.slice(5), v]);
-  if (metaPairs.length === 0) return items;
-  return items.filter(d => {
-    const m = d.meta || {};
-    return metaPairs.every(([mk, mv]) => String(m[mk]) === String(mv));
-  });
-}
-
-// ---------- Document routes ----------
-app.post('/doc', resolveProjectId, requireConfirmedProject, (req, res) => {
-  const { doc_type, title, body_md = '', tags = [], meta = {} } = req.body || {};
-  if (!doc_type || !title) return res.status(400).json({ error: 'doc_type and title required' });
-  const id = genId();
-  const now = new Date().toISOString();
-  const doc = { id, project_id: req.project.id, doc_type, title, body_md, tags, meta, created_at: now, updated_at: now };
-  db.docs.set(id, doc);
-  res.json(mapDoc(doc));
-});
-
-app.get('/doc', resolveProjectId, (req, res) => {
-  const { title, doc_type, ci = 'false' } = req.query;
-  let items = Array.from(db.docs.values()).filter(d => d.project_id === req.project.id && !d.deleted_at);
-  if (title) {
-    if (ci === 'true') {
-      const nt = normalizeTitle(title);
-      items = items.filter(d => normalizeTitle(d.title) === nt);
-    } else {
-      items = items.filter(d => d.title === title);
-    }
-  }
-  if (doc_type) items = items.filter(d => d.doc_type === doc_type);
-  items = applyTagFilter(items, req.query);
-  items = applyMetaFilter(items, req.query);
-  res.json(items.map(mapDoc));
-});
-
-app.get('/doc/:id', resolveProjectId, (req, res) => {
-  const doc = db.docs.get(req.params.id);
-  if (!doc || doc.project_id !== req.project.id || doc.deleted_at) return res.status(404).json({ error: 'doc not found' });
-  res.json(mapDoc(doc));
-});
-
-app.patch('/doc/:id', resolveProjectId, requireConfirmedProject, (req, res) => {
-  const doc = db.docs.get(req.params.id);
-  if (!doc || doc.project_id !== req.project.id || doc.deleted_at) return res.status(404).json({ error: 'doc not found' });
-  const { doc_type, title, body_md, tags, meta } = req.body || {};
-  const { append = 'false' } = req.query;
-  if (doc_type) doc.doc_type = doc_type;
-  if (title) doc.title = title;
-  if (Array.isArray(tags)) doc.tags = tags;
-  if (meta && typeof meta === 'object') doc.meta = meta;
-  if (typeof body_md === 'string') {
-    if (append === 'true') doc.body_md = (doc.body_md || '') + '\n' + body_md;
-    else doc.body_md = body_md;
-  }
-  doc.updated_at = new Date().toISOString();
-  res.json(mapDoc(doc));
-});
-
-// Safe delete & restore
-app.delete('/doc/:id', (req, res) => {
-  const { id } = req.params;
-  const { purge = 'false' } = req.query;
-  const confirmTitle = req.header('x-confirm-title');
-  const doc = db.docs.get(id);
-  if (!doc) {
-    if (purge === 'true' && db.trash.docs.has(id)) { purgeDoc(id); return res.json({ ok: true, purged: true }); }
-    return res.status(404).json({ error: 'doc not found' });
-  }
-  if (confirmTitle && confirmTitle !== doc.title) return res.status(412).json({ error: 'confirmation title mismatch', expected: doc.title });
-  softDeleteDoc(doc, 'api');
-  if (purge === 'true') purgeDoc(id);
-  res.json({ ok: true, deleted: true, purged: purge === 'true' });
-});
-
-app.delete('/projects/:id', (req, res) => {
-  const { id } = req.params;
-  const { cascade = 'false', purge = 'false' } = req.query;
-  const confirmName = req.header('x-confirm-name');
-  const proj = db.projects.get(id);
-  if (!proj) {
-    if (purge === 'true' && db.trash.projects.has(id)) { purgeProject(id); return res.json({ ok: true, purged: true }); }
-    return res.status(404).json({ error: 'project not found' });
-  }
-  if (!confirmName || confirmName !== proj.name) {
-    return res.status(412).json({ error: 'confirmation required', hint: 'Send header x-confirm-name with exact project name', expected: proj.name });
-  }
-  const children = Array.from(db.docs.values()).filter(d => d.project_id === proj.id && !d.deleted_at);
-  if (children.length > 0 && cascade !== 'true') {
-    return res.status(409).json({ error: 'project has documents', count: children.length, hint: 'Retry with ?cascade=true' });
-  }
-  if (cascade === 'true') { for (const d of children) softDeleteDoc(d, 'cascade'); }
-  softDeleteProject(proj, 'api');
-  if (purge === 'true') {
-    for (const [docId, d] of db.trash.docs.entries()) if (d.project_id === proj.id) db.trash.docs.delete(docId);
-    purgeProject(id);
-  }
-  res.json({ ok: true, deleted: true, purged: purge === 'true', cascaded_docs: cascade === 'true' ? children.length : 0 });
-});
-
-app.post('/doc/:id/restore', (req, res) => {
-  const { id } = req.params;
-  const snap = db.trash.docs.get(id);
-  if (!snap) return res.status(404).json({ error: 'not found in trash' });
-  const restored = { ...snap }; delete restored.deleted_at; delete restored.deleted_by;
-  db.docs.set(id, restored); db.trash.docs.delete(id);
-  res.json({ ok: true, restored: true, doc: mapDoc(restored) });
-});
-
-app.post('/projects/:id/restore', (req, res) => {
-  const { id } = req.params;
-  const snap = db.trash.projects.get(id);
-  if (!snap) return res.status(404).json({ error: 'not found in trash' });
-  const restored = { ...snap }; delete restored.deleted_at; delete restored.deleted_by;
-  db.projects.set(id, restored); db.trash.projects.delete(id);
-  res.json({ ok: true, restored: true, project: restored });
-});
-
-// ---------- Health ----------
+// Health
 app.get('/health', (_req, res) => {
-  res.json({
-    ok: true,
-    version: '2.4.0',
-    defaults: { project_id: DEFAULT_PROJECT_ID },
-    toggles: { ALLOW_AUTOCONFIRM },
-    cors_origin: CORS_ORIGIN
-  });
+  res.json({ ok: true, version: '2.5.0-pg', db: 'postgres' });
 });
 
-// ---------- Lyra helpers ----------
-app.post('/lyra/paste-save', resolveProjectId, requireConfirmedProject, (req, res) => {
-  const { docMode = 'create', sceneWriteMode = 'overwrite', id, payload = {} } = req.body || {};
-  const { doc_type, title, body_md = '', tags = [], meta = {} } = payload;
-  if (!doc_type || !title) return res.status(400).json({ error: 'doc_type and title required' });
+// Boot
+(async () => {
+  await db.init();
+  app.listen(PORT, () => console.log(`Server v2.5.0-pg on :${PORT}`));
+})();
 
-  if (docMode === 'update') {
-    if (!id) return res.status(400).json({ error: 'id is required for update' });
-    const existing = db.docs.get(id);
-    if (!existing || existing.project_id !== req.project.id) return res.status(404).json({ error: 'doc not found in this project' });
-    existing.doc_type = doc_type;
-    existing.title = title;
-    existing.tags = tags;
-    existing.meta = meta;
-    if (sceneWriteMode === 'append') existing.body_md = (existing.body_md || '') + '\n' + body_md;
-    else existing.body_md = body_md;
-    existing.updated_at = new Date().toISOString();
-    return res.json({ ok: true, mode: 'update', doc: mapDoc(existing) });
-  }
 
-  const newId = genId();
-  const now = new Date().toISOString();
-  const doc = { id: newId, project_id: req.project.id, doc_type, title, body_md, tags, meta, created_at: now, updated_at: now };
-  db.docs.set(newId, doc);
-  return res.json({ ok: true, mode: 'create', doc: mapDoc(doc) });
-});
 
-app.get('/lyra/read', resolveProjectId, (req, res) => {
-  const { id, title, doc_type, ci = 'false' } = req.query;
-  const metaFilters = Object.fromEntries(Object.entries(req.query).filter(([k]) => k.startsWith('meta.')).map(([k, v]) => [k.slice(5), v]));
+{marker}
+// -----------------------------------------------------------------------------
+// Full-Text Search endpoint (/search)
+// Requires: a generated `ts` column on `docs` and a GIN index (docs_fts_idx).
+// Falls back to substring matching if direct FTS isn't available.
+// -----------------------------------------------------------------------------
+app.get('/search', async (req, res) => {
+  try {
+    const { project_name, q, limit = 25 } = req.query;
+    if (!project_name || !q) return res.status(400).json({ error: 'project_name and q required' });
 
-  let candidates = Array.from(db.docs.values()).filter(d => d.project_id === req.project.id && !d.deleted_at);
+    const proj = await db.findProjectByName(project_name);
+    if (!proj) return res.status(404).json({ error: 'project not found' });
 
-  if (id) {
-    const doc = db.docs.get(id);
-    if (!doc || doc.project_id !== req.project.id || doc.deleted_at) return res.status(404).json({ error: 'doc not found' });
-    return res.json({ ok: true, doc: mapDoc(doc) });
-  }
+    const hardLimit = Math.min(parseInt(limit, 10) || 25, 200);
 
-  if (title) {
-    if (ci === 'true') {
-      const nt = normalizeTitle(title);
-      candidates = candidates.filter(d => normalizeTitle(d.title) === nt);
-    } else {
-      candidates = candidates.filter(d => d.title === title);
+    if (db._pool && typeof db._pool.query === 'function') {
+      const { rows } = await db._pool.query(
+        `select id, project_id, doc_type, title, left(body_md, 800) as body_md, tags, meta, created_at, updated_at
+           from docs
+          where project_id = $1
+            and deleted_at is null
+            and ts @@ plainto_tsquery('english', $2)
+          order by ts_rank(ts, plainto_tsquery('english', $2)) desc, updated_at desc
+          limit $3`,
+        [proj.id, q, hardLimit]
+      );
+      return res.json(rows.map(r => ({ ...r, tags: Array.isArray(r.tags) ? r.tags : JSON.parse(r.tags || '[]') })));
     }
-  }
-  if (doc_type) candidates = candidates.filter(d => d.doc_type === doc_type);
 
-  candidates = applyTagFilter(candidates, req.query);
-  for (const [mk, mv] of Object.entries(metaFilters)) {
-    candidates = candidates.filter(d => d.meta && String(d.meta[mk]) === String(mv));
+    let docs = await db.listDocs({ project_id: proj.id });
+    const needle = String(q).toLowerCase();
+    docs = docs.filter(d => (d.title || '').toLowerCase().includes(needle) ||
+                            (d.body_md || '').toLowerCase().includes(needle))
+               .slice(0, hardLimit);
+    return res.json(docs);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'search failed' });
   }
-
-  if (candidates.length === 0) return res.status(404).json({ error: 'no matches' });
-  if (candidates.length === 1) return res.json({ ok: true, doc: mapDoc(candidates[0]) });
-  return res.json({ ok: true, docs: candidates.map(mapDoc) });
 });
 
-app.get('/lyra/read-stream', resolveProjectId, (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  const send = (event, data) => { res.write(`event: ${event}\n`); res.write(`data: ${JSON.stringify(data)}\n\n`); };
+// -----------------------------------------------------------------------------
+// Streaming reader (/read-stream) — Server-Sent Events
+// Usage:
+//   GET /read-stream?project_name=...&id=<docId>
+//   or GET /read-stream?project_name=...&title=...&ci=true
+// -----------------------------------------------------------------------------
+app.get('/read-stream', async (req, res) => {
+  try {
+    const { project_name, id, title, ci = 'false' } = req.query;
+    if (!project_name) return res.status(400).json({ error: 'project_name required' });
+    const proj = await db.findProjectByName(project_name);
+    if (!proj) return res.status(404).json({ error: 'project not found' });
 
-  const { id, title, doc_type, ci = 'false' } = req.query;
-  let candidates = Array.from(db.docs.values()).filter(d => d.project_id === req.project.id && !d.deleted_at);
-
-  if (id) {
-    const doc = db.docs.get(id);
-    if (!doc || doc.project_id !== req.project.id || doc.deleted_at) { send('error', { error: 'doc not found' }); return res.end(); }
-    candidates = [doc];
-  } else {
-    if (title) {
+    let doc = null;
+    if (id) {
+      const d = await db.getDocById(id);
+      if (d && d.project_id === proj.id && !d.deleted_at) doc = d;
+    } else if (title) {
+      let list = await db.listDocs({ project_id: proj.id, title: (ci !== 'true') ? title : undefined });
       if (ci === 'true') {
-        const nt = normalizeTitle(title);
-        candidates = candidates.filter(d => normalizeTitle(d.title) === nt);
-      } else {
-        candidates = candidates.filter(d => d.title === title);
+        const nt = String(title).toLowerCase().replace(/\s+/g, ' ').trim();
+        list = list.filter(d => String(d.title).toLowerCase().replace(/\s+/g, ' ').trim() === nt);
       }
-    }
-    if (doc_type) candidates = candidates.filter(d => d.doc_type === doc_type);
-    candidates = applyTagFilter(candidates, req.query);
-    candidates = applyMetaFilter(candidates, req.query);
-  }
-
-  if (candidates.length === 0) { send('error', { error: 'no matches' }); return res.end(); }
-  const doc = candidates[0];
-  send('start', { id: doc.id, title: doc.title });
-  const text = String(doc.body_md || '');
-  const chunkSize = 256; let idx = 0;
-  const interval = setInterval(() => {
-    if (idx >= text.length) { clearInterval(interval); send('done', { bytes: text.length }); res.end(); return; }
-    const chunk = text.slice(idx, idx + chunkSize); idx += chunkSize; send('delta', { chunk });
-  }, 25);
-});
-
-app.post('/lyra/ingest', resolveProjectId, requireConfirmedProject, (req, res) => {
-  const { docs = [] } = req.body || {};
-  if (!Array.isArray(docs) || docs.length === 0) return res.status(400).json({ error: 'docs array required' });
-  const results = [];
-  for (const item of docs) {
-    const { id, doc_type, title, body_md = '', tags = [], meta = {} } = item || {};
-    if (!doc_type || !title) { results.push({ ok: false, error: 'doc_type and title required' }); continue; }
-    if (id && db.docs.has(id)) {
-      const existing = db.docs.get(id);
-      if (existing.project_id !== req.project.id) { results.push({ ok: false, error: 'doc belongs to different project', id }); continue; }
-      existing.doc_type = doc_type; existing.title = title; existing.body_md = body_md; existing.tags = tags; existing.meta = meta; existing.updated_at = new Date().toISOString();
-      results.push({ ok: true, id: existing.id, mode: 'update' });
+      doc = list[0] || null;
     } else {
-      const newId = genId(); const now = new Date().toISOString();
-      const doc = { id: newId, project_id: req.project.id, doc_type, title, body_md, tags, meta, created_at: now, updated_at: now };
-      db.docs.set(newId, doc);
-      results.push({ ok: true, id: newId, mode: 'create' });
+      return res.status(400).json({ error: 'id or title required' });
     }
+    if (!doc) return res.status(404).json({ error: 'doc not found' });
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    const send = (event, data) => {
+      res.write(`event: ${event}\n`);
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+
+    send('start', { id: doc.id, title: doc.title });
+    const text = String(doc.body_md || '');
+    const chunkSize = 512;
+    let idx = 0;
+
+    const interval = setInterval(() => {
+      if (idx >= text.length) {
+        clearInterval(interval);
+        send('done', { bytes: text.length });
+        res.end();
+        return;
+      }
+      const chunk = text.slice(idx, idx + chunkSize);
+      idx += chunkSize;
+      send('delta', { chunk });
+    }, 20);
+  } catch (e) {
+    console.error(e);
+    try {
+      res.write(`event: error\n`);
+      res.write(`data: ${JSON.stringify({ error: 'read-stream failed' })}\n\n`);
+      res.end();
+    } catch { /* noop */ }
   }
-  res.json({ ok: true, count: results.length, results });
 });
 
-app.post('/lyra/command', (req, res) => {
-  const { command, args = {} } = req.body || {};
-  if (!command) return res.status(400).json({ error: 'command required' });
-  switch (command) {
-    case '/confirm-project': {
-      const { project_name, slug, id } = args;
-      let proj = null;
-      if (id) proj = db.projects.get(id);
-      else if (project_name) proj = findProjectByName(project_name);
-      else if (slug) proj = findProjectBySlug(slug);
-      if (!proj || proj.deleted_at) return res.status(404).json({ error: 'project not found' });
-      proj.confirmed = true; proj.require_confirmation = false; proj.blocked = false; proj.updated_at = new Date().toISOString();
-      return res.json({ ok: true, project: proj });
+// -----------------------------------------------------------------------------
+// Project export (/export) — download JSON of the whole project
+//   GET /export?project_name=...
+// -----------------------------------------------------------------------------
+app.get('/export', async (req, res) => {
+  try {
+    const { project_name } = req.query;
+    if (!project_name) return res.status(400).json({ error: 'project_name required' });
+    const proj = await db.findProjectByName(project_name);
+    if (!proj) return res.status(404).json({ error: 'project not found' });
+    const docs = await db.listDocs({ project_id: proj.id });
+
+    const filename = `${(proj.slug || proj.name || 'project').toLowerCase().replace(/[^a-z0-9-]+/g,'-')}-export.json`;
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    res.write('{"project":');
+    res.write(JSON.stringify(proj));
+    res.write(',"docs":[');
+    for (let i = 0; i < docs.length; i++) {
+      if (i > 0) res.write(',');
+      res.write(JSON.stringify(docs[i]));
     }
-    default:
-      return res.status(400).json({ error: 'unknown command', command });
+    res.write(']}');
+    res.end();
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'export failed' });
   }
 });
 
-app.get('/lyra/modes', (_req, res) => {
-  res.json({
-    ok: true,
-    version: '2.4.0',
-    modes: {
-      read: { route: '/lyra/read', stream: '/lyra/read-stream' },
-      write: { route: '/lyra/paste-save' },
-      ingest: { route: '/lyra/ingest' },
-      commands: { route: '/lyra/command', commands: ['/confirm-project'] }
-    }
-  });
-});
-
-// ---------- Start ----------
-app.listen(PORT, () => {
-  console.log(`Writing API v2.4.0 (ESM) listening on :${PORT}`);
-});
+// Alias for Lyra parity (optional): /lyra/read-stream -> /read-stream
+app.get('/lyra/read-stream', (req, res, next) => (req.url = req.url.replace('/lyra/read-stream', '/read-stream'), next()), (req, res) => {});

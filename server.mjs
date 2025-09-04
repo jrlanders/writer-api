@@ -39,7 +39,7 @@ app.use(express.json());
 // -----------------------------------------------------------------------------
 // Configuration
 // -----------------------------------------------------------------------------
-const app = express();
+
 const PORT = process.env.PORT || 3000;
 const SELF_BASE = `http://127.0.0.1:${PORT}`;
 const ALLOW_AUTOCONFIRM = process.env.ALLOW_AUTOCONFIRM === '1';

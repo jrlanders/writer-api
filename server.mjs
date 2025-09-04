@@ -19,12 +19,28 @@ import dotenv from 'dotenv';
 
 
 // --- your internal modules ---
-import { initDb } from "./db.pg.mjs";   // example: your DB bootstrap
+import * as DB from "./db.pg.mjs";  // example: your DB bootstrap
 // import { otherHelpers } from "./whatever.mjs";
 
 // server.mjs
 // --- new middleware import ---
 import { makeMiddleware } from './mw/middleware.mjs';
+
+// put this near the top (after imports)
+async function resolveDbHandle() {
+  // Support several possible export styles
+  if (typeof DB.initDb === "function") return await DB.initDb();
+  if (typeof DB.init === "function") return await DB.init();
+  if (typeof DB.default === "function") return await DB.default();                // default export is a factory
+  if (DB.default && typeof DB.default.initDb === "function") return await DB.default.initDb();
+  if (DB.default && typeof DB.default.init === "function") return await DB.default.init();
+
+  // If it exports a ready-made handle (object with query/_pool), just return it
+  if (DB.default && (DB.default.query || DB.default._pool)) return DB.default;
+  if (DB.query || DB._pool) return DB;
+
+  throw new Error("db.pg.mjs does not expose initDb/init/default factory or a ready DB handle.");
+}
 
 // --- app setup ---
 dotenv.config();
@@ -500,12 +516,23 @@ app.get('/export', async (req, res) => {
 // -----------------------------------------------------------------------------
 // Boot
 // -----------------------------------------------------------------------------
+// --- Boot: init DB + start server ---
+let db;  // keep this in outer scope so routes can use it
+
 (async () => {
   try {
-    db = await initDb();
-    if (typeof db.init === 'function') await db.init();
-    app.locals.db = db;
-    app.listen(PORT, () => console.log(`Server v2.6.1-pg on :${PORT}`));
+    db = await resolveDbHandle();
+    // If the returned object also has an .init(), run it (optional migrations/seeds)
+    if (db && typeof db.init === "function") {
+      await db.init();
+    }
+
+    // Make available to routes if you use req.app.locals.db
+    if (app && app.locals) app.locals.db = db;
+
+    app.listen(PORT, () => {
+      console.log(`Server v2.6.1-pg on :${PORT}`);
+    });
   } catch (e) {
     console.error("Boot failure:", e);
     process.exit(1);

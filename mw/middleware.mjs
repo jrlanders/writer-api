@@ -2,9 +2,15 @@
 import express from "express";
 import { z } from "zod";
 
-// NOTE: baseUrl should be http://127.0.0.1:${PORT} from server.mjs
+// Exported factory that builds and returns the /mw router
 export function makeMiddleware({ baseUrl }) {
   const mw = express.Router();
+
+  // Ensure JSON body parsing for all /mw routes
+  mw.use(express.json());
+
+  // ---- quick health probe so you can verify the mount ----
+  mw.get("/health", (req, res) => res.json({ ok: true, where: "middleware" }));
 
   // --------- Schemas ----------
   const structureSchema = z.object({
@@ -30,11 +36,15 @@ export function makeMiddleware({ baseUrl }) {
   async function httpJson(url, opts = {}) {
     const r = await fetch(url, {
       ...opts,
-      headers: { "content-type": "application/json", ...(opts.headers || {}) }
+      headers: {
+        "accept": "application/json",
+        "content-type": "application/json",
+        ...(opts.headers || {})
+      }
     });
     const text = await r.text();
-    let json;
-    try { json = text ? JSON.parse(text) : null; } catch { json = null; }
+    let json = null;
+    try { json = text ? JSON.parse(text) : null; } catch { /* leave json = null */ }
     return { ok: r.ok, status: r.status, json, text };
   }
 
@@ -80,14 +90,17 @@ export function makeMiddleware({ baseUrl }) {
   };
 
   // --------- Endpoints ----------
+
   // Upsert a scene by title or structure; append notes if provided
-  mw.post("/save-scene", express.json(), async (req, res) => {
+  mw.post("/save-scene", async (req, res) => {
     try {
       const args = saveSceneSchema.parse(req.body);
       const { project_name, title, structure, location, start, end, tags = [], notes_append } = args;
 
       // Resolve existing doc (prefer title; fallback to structure)
-      const existing = (await lyraReadByTitle(project_name, title)) || (await lyraReadByStructure(project_name, structure));
+      const existing =
+        (await lyraReadByTitle(project_name, title)) ||
+        (await lyraReadByStructure(project_name, structure));
 
       const payload = {
         project_name,
@@ -97,7 +110,7 @@ export function makeMiddleware({ baseUrl }) {
         payload: {
           doc_type: "scene",
           title,
-          ...(notes_append ? { body_md: `\n${notes_append}` } : {}),
+          ...(notes_append ? { body_md: `\\n${notes_append}` } : {}),
           tags: Array.from(new Set(["scene", ...(structure.act ? [`Act ${structure.act}`] : []), ...tags])),
           meta: {
             structure: {
@@ -115,7 +128,12 @@ export function makeMiddleware({ baseUrl }) {
       };
 
       const result = await lyraPasteSave(payload);
-      res.json({ ok: true, mode: existing ? "update" : "create", id: result.document_id || existing?.id || null, title });
+      res.json({
+        ok: true,
+        mode: existing ? "update" : "create",
+        id: result.document_id || existing?.id || null,
+        title
+      });
     } catch (e) {
       res.status(400).json({ ok: false, error: String(e.message || e) });
     }
@@ -132,11 +150,11 @@ export function makeMiddleware({ baseUrl }) {
       if (section) params.set("meta.section", String(section));
       if (chapter) params.set("meta.chapter", String(chapter));
 
-      const { ok, status, json } = await httpJson(`${baseUrl}/lyra/read?${params.toString()}`);
-      if (status === 404) return res.json({ ok: true, count: 0, scenes: [] });
-      if (!ok) throw new Error(`list-scenes ${status}`);
+      const r = await httpJson(`${baseUrl}/lyra/read?${params.toString()}`);
+      if (r.status === 404) return res.json({ ok: true, count: 0, scenes: [] });
+      if (!r.ok || !r.json) return res.status(502).json({ ok: false, error: `upstream ${r.status}` });
 
-      const docs = json.docs || (json.doc ? [json.doc] : []);
+      const docs = r.json.docs || (r.json.doc ? [r.json.doc] : []);
       const scenes = docs.map(d => ({
         id: d.id,
         title: d.title,
@@ -155,11 +173,11 @@ export function makeMiddleware({ baseUrl }) {
       const { project_name } = req.query;
       if (!project_name) return res.status(400).json({ ok: false, error: "project_name required" });
 
-      const { ok, status, json } = await httpJson(`${baseUrl}/lyra/read?project_name=${enc(project_name)}&doc_type=scene`);
-      if (status === 404) return res.json({ ok: true, count: 0, lines: [] });
-      if (!ok) throw new Error(`toc scenes read ${status}`);
+      const r = await httpJson(`${baseUrl}/lyra/read?project_name=${enc(project_name)}&doc_type=scene`);
+      if (r.status === 404) return res.json({ ok: true, count: 0, lines: [] });
+      if (!r.ok || !r.json) return res.status(502).json({ ok: false, error: `upstream ${r.status}`, body: r.text?.slice(0,400) });
 
-      const docs = json.docs || (json.doc ? [json.doc] : []);
+      const docs = r.json.docs || (r.json.doc ? [r.json.doc] : []);
       const ordered = docs.sort((a, b) => {
         const A = a.meta?.structure || {}, B = b.meta?.structure || {};
         const k = x => [x.act || "", x.section || 0, x.chapter || 0, String(x.scene ?? "")];
@@ -168,8 +186,12 @@ export function makeMiddleware({ baseUrl }) {
 
       const lines = ordered.map(d => {
         const s = d.meta?.structure || {};
-        const path = [s.act && `Act ${s.act}`, s.section != null && `Section ${s.section}`, s.chapter != null && `Chapter ${s.chapter}`, s.scene != null && `Scene ${s.scene}`]
-          .filter(Boolean).join(" > ");
+        const path = [
+          s.act && `Act ${s.act}`,
+          s.section != null && `Section ${s.section}`,
+          s.chapter != null && `Chapter ${s.chapter}`,
+          s.scene != null && `Scene ${s.scene}`
+        ].filter(Boolean).join(" > ");
         return `${path} — ${d.title} (${d.id})`;
       });
 

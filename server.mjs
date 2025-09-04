@@ -15,13 +15,33 @@
 import express from 'express';
 import cors from 'cors';
 import crypto from 'node:crypto';
-import db from './db.pg.mjs';
+
+// --- your internal modules ---
+import { initDb } from "./db.pg.mjs";   // example: your DB bootstrap
+// import { otherHelpers } from "./whatever.mjs";
+
+// server.mjs
+// --- new middleware import ---
+import { makeMiddleware } from './middleware.mjs';
+
+// --- app setup ---
+dotenv.config();
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+
+// ... your existing routes ...
+
+
+// app.listen(...)
 
 // -----------------------------------------------------------------------------
 // Configuration
 // -----------------------------------------------------------------------------
 const app = express();
 const PORT = process.env.PORT || 3000;
+const SELF_BASE = `http://127.0.0.1:${PORT}`;
 const ALLOW_AUTOCONFIRM = process.env.ALLOW_AUTOCONFIRM === '1';
 const CORS_ORIGIN = (process.env.CORS_ORIGIN || 'http://localhost:3000,*')
   .split(',').map(s => s.trim()).filter(Boolean);
@@ -34,6 +54,7 @@ const genId = () => (typeof crypto.randomUUID === 'function'
 // -----------------------------------------------------------------------------
 // Middleware
 // -----------------------------------------------------------------------------
+app.use("/mw", makeMiddleware({ baseUrl: SELF_BASE }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cors({

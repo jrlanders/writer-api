@@ -15,6 +15,8 @@
 import express from 'express';
 import cors from 'cors';
 import crypto from 'node:crypto';
+import dotenv from 'dotenv';
+
 
 // --- your internal modules ---
 import { initDb } from "./db.pg.mjs";   // example: your DB bootstrap
@@ -22,7 +24,7 @@ import { initDb } from "./db.pg.mjs";   // example: your DB bootstrap
 
 // server.mjs
 // --- new middleware import ---
-import { makeMiddleware } from './middleware.mjs';
+import { makeMiddleware } from './mw/middleware.mjs';
 
 // --- app setup ---
 dotenv.config();
@@ -499,6 +501,13 @@ app.get('/export', async (req, res) => {
 // Boot
 // -----------------------------------------------------------------------------
 (async () => {
-  await db.init();
-  app.listen(PORT, () => console.log(`Server v2.6.1-pg on :${PORT}`));
+  try {
+    db = await initDb();
+    if (typeof db.init === 'function') await db.init();
+    app.locals.db = db;
+    app.listen(PORT, () => console.log(`Server v2.6.1-pg on :${PORT}`));
+  } catch (e) {
+    console.error("Boot failure:", e);
+    process.exit(1);
+  }
 })();

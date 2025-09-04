@@ -133,6 +133,27 @@ app.post('/projects/confirm', async (req, res) => {
   }
 });
 
+app.get('/counts', async (req, res) => {
+  try {
+    const { project_name } = req.query;
+    if (!project_name) return res.status(400).json({ error: 'project_name required' });
+    const proj = await db.findProjectByName(project_name);
+    if (!proj) return res.status(404).json({ error: 'project not found' });
+
+    const { rows } = await db._pool.query(
+      `select doc_type, count(*)::int as count
+         from docs
+        where project_id = $1 and deleted_at is null
+        group by doc_type
+        order by doc_type`,
+      [proj.id]
+    );
+    res.json({ ok: true, project_id: proj.id, counts: rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'counts failed' });
+  }
+});
 // -----------------------------------------------------------------------------
 /** Document routes */
 // -----------------------------------------------------------------------------

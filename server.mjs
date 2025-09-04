@@ -128,8 +128,23 @@ app.post('/projects', async (req, res) => {
 
 // List all projects
 app.get('/projects', async (_req, res) => {
-  try { res.json(await db.listProjects()); }
-  catch (e) { console.error(e); res.status(500).json({ error: 'list failed' }); }
+  try {
+    if (db && typeof db.listProjects === 'function') {
+      const list = await db.listProjects();
+      return res.json(list);
+    }
+    // Fallback to SQL
+    const { rows } = await db._pool.query(
+      `select id, name, slug, kind, parent_id, confirmed, require_confirmation, blocked, created_at, updated_at, deleted_at
+         from projects
+        where deleted_at is null
+        order by created_at desc`
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error('projects list failed', e);
+    res.status(500).json({ error: 'list failed' });
+  }
 });
 
 // Find project by name or slug
@@ -193,6 +208,32 @@ app.get('/counts', async (req, res) => {
     res.status(500).json({ error: 'counts failed' });
   }
 });
+
+// --- diagnostics: check DB handle + tables ---
+app.get('/__diag', async (req, res) => {
+  try {
+    const dbh = (app.locals && app.locals.db) || global.db || null;
+    const info = {
+      has_db: !!dbh,
+      has_pool: !!(dbh && dbh._pool),
+      methods: dbh ? Object.keys(dbh).filter(k => typeof dbh[k] === 'function') : [],
+    };
+    let tables = [];
+    if (dbh && dbh._pool) {
+      const q = `
+        select table_schema, table_name
+        from information_schema.tables
+        where table_schema='public'
+        order by table_name`;
+      const { rows } = await dbh._pool.query(q);
+      tables = rows.map(r => `${r.table_schema}.${r.table_name}`);
+    }
+    res.json({ ok: true, info, tables });
+  } catch (e) {
+    console.error('diag error', e);
+    res.status(500).json({ ok: false, error: 'diag failed' });
+  }
+});
 // -----------------------------------------------------------------------------
 /** Document routes */
 // -----------------------------------------------------------------------------
@@ -217,12 +258,41 @@ app.post('/doc', async (req, res) => {
 app.get('/doc', async (req, res) => {
   try {
     const { project_name } = req.query;
-    const proj = await db.findProjectByName(project_name);
+    if (!project_name) return res.status(400).json({ error: 'project_name required' });
+
+    // find project
+    let proj;
+    if (db && typeof db.findProjectByName === 'function') {
+      proj = await db.findProjectByName(project_name);
+    } else {
+      const { rows } = await db._pool.query(`select * from projects where lower(name) = lower($1) and deleted_at is null limit 1`, [project_name]);
+      proj = rows[0];
+    }
     if (!proj) return res.status(404).json({ error: 'project not found' });
-    const docs = await db.listDocs({ project_id: proj.id });
-    res.json(docs);
+
+    // if helper exists, use it
+    if (db && typeof db.listDocs === 'function') {
+      const docs = await db.listDocs({ project_id: proj.id });
+      return res.json(docs);
+    }
+
+    // fallback: pick docs/documents table dynamically
+    const tCheck = await db._pool.query(`
+      select table_name from information_schema.tables
+      where table_schema='public' and table_name in ('docs','documents')`);
+    const tname = (tCheck.rows[0]?.table_name) || 'docs';
+
+    const { rows } = await db._pool.query(
+      `select id, project_id, doc_type, title, body_md, tags, meta, created_at, updated_at, deleted_at
+         from ${tname}
+        where project_id = $1 and (deleted_at is null)
+        order by updated_at desc
+        limit 500`,  // keep it sane
+      [proj.id]
+    );
+    res.json(rows);
   } catch (e) {
-    console.error(e);
+    console.error('doc list failed', e);
     res.status(500).json({ error: 'doc list failed' });
   }
 });
@@ -318,21 +388,53 @@ app.post('/lyra/paste-save', async (req, res) => {
 app.get('/lyra/read', async (req, res) => {
   try {
     const { project_name, id, title, doc_type, ci = 'false' } = req.query || {};
-    const proj = await db.findProjectByName(project_name);
+    if (!project_name) return res.status(400).json({ error: 'project_name required' });
+
+    // project
+    let proj;
+    if (db && typeof db.findProjectByName === 'function') {
+      proj = await db.findProjectByName(project_name);
+    } else {
+      const { rows } = await db._pool.query(`select * from projects where lower(name)=lower($1) and deleted_at is null limit 1`, [project_name]);
+      proj = rows[0];
+    }
     if (!proj) return res.status(404).json({ error: 'project not found' });
 
+    // prefer helpers if available
+    const tCheck = await db._pool.query(`
+      select table_name from information_schema.tables
+      where table_schema='public' and table_name in ('docs','documents')`);
+    const tname = (tCheck.rows[0]?.table_name) || 'docs';
+
+    // by id
     if (id) {
-      const d = await db.getDocById(id);
-      if (!d || d.project_id !== proj.id || d.deleted_at) return res.status(404).json({ error: 'doc not found' });
-      return res.json({ ok: true, doc: d });
+      const q = `select * from ${tname} where id=$1 and project_id=$2 and deleted_at is null limit 1`;
+      const { rows } = await db._pool.query(q, [id, proj.id]);
+      const d = rows[0];
+      return d ? res.json({ ok: true, doc: d }) : res.status(404).json({ error: 'doc not found' });
     }
 
-    let docs = await db.listDocs({ project_id: proj.id, title: title && ci !== 'true' ? title : undefined, doc_type });
+    // by filters
+    const params = [proj.id];
+    const where = [`project_id = $1`, `(deleted_at is null)`];
+
+    if (doc_type) { params.push(doc_type); where.push(`doc_type = $${params.length}`); }
+    if (title && ci !== 'true') { params.push(title); where.push(`title = $${params.length}`); }
+
+    // run base query
+    const { rows } = await db._pool.query(
+      `select * from ${tname} where ${where.join(' and ')} order by updated_at desc limit 500`,
+      params
+    );
+
+    // case-insensitive exact title
+    let docs = rows;
     if (title && ci === 'true') {
       const nt = String(title).toLowerCase().replace(/\s+/g, ' ').trim();
-      docs = docs.filter(d => String(d.title).toLowerCase().replace(/\s+/g, ' ').trim() === nt);
+      docs = rows.filter(d => String(d.title).toLowerCase().replace(/\s+/g, ' ').trim() === nt);
     }
 
+    // tag filter
     const q = req.query || {};
     const wantTags = (q.tags ? String(q.tags).split(',').map(s => s.trim()).filter(Boolean) : []);
     if (wantTags.length) {
@@ -343,6 +445,7 @@ app.get('/lyra/read', async (req, res) => {
       });
     }
 
+    // meta.* filters
     const metaPairs = Object.entries(q).filter(([k]) => k.startsWith('meta.'));
     if (metaPairs.length) {
       docs = docs.filter(d => metaPairs.every(([k, v]) => String(d.meta?.[k.slice(5)] ?? '') === String(v)));
@@ -352,7 +455,7 @@ app.get('/lyra/read', async (req, res) => {
     if (docs.length === 1) return res.json({ ok: true, doc: docs[0] });
     res.json({ ok: true, docs });
   } catch (e) {
-    console.error(e);
+    console.error('lyra/read failed', e);
     res.status(500).json({ error: 'read failed' });
   }
 });

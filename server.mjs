@@ -44,6 +44,106 @@ async function resolveDbHandle() {
   throw new Error('db.pg.mjs does not expose an initializer or ready handle.');
 }
 
+// --- Projects routes (add above the boot block) ---
+
+// List projects
+app.get('/projects', async (_req, res) => {
+  try {
+    if (app.locals?.db?.listProjects) {
+      const list = await app.locals.db.listProjects();
+      return res.json(list);
+    }
+    const db = app.locals.db;
+    const { rows } = await db._pool.query(
+      `select id, name, slug, kind, parent_id, confirmed, require_confirmation, blocked,
+              created_at, updated_at, deleted_at
+         from projects
+        where deleted_at is null
+        order by created_at desc`
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error('GET /projects failed', e);
+    res.status(500).json({ error: 'list failed' });
+  }
+});
+
+// Create a project (idempotent by name)
+app.post('/projects', async (req, res) => {
+  try {
+    const { name, kind = 'book', parent_id = null } = req.body || {};
+    if (!name) return res.status(400).json({ error: 'name required' });
+
+    const db = app.locals.db;
+    if (db.findProjectByName && db.createProject) {
+      const existing = await db.findProjectByName(name);
+      if (existing) return res.status(409).json({ error: 'name already exists', id: existing.id });
+      const proj = await db.createProject({
+        id: crypto.randomUUID(),
+        name,
+        slug: name.toLowerCase().trim().replace(/\s+/g, '-'),
+        kind,
+        parent_id
+      });
+      return res.json(proj);
+    }
+
+    // SQL fallback
+    const exists = await db._pool.query(
+      `select id from projects where lower(name)=lower($1) and deleted_at is null limit 1`,
+      [name]
+    );
+    if (exists.rows[0]) return res.status(409).json({ error: 'name already exists', id: exists.rows[0].id });
+    const insert = await db._pool.query(
+      `insert into projects (id, name, slug, kind, parent_id, confirmed, require_confirmation, blocked)
+       values ($1,$2,$3,$4,$5,false,true,false)
+       returning *`,
+      [crypto.randomUUID(), name, name.toLowerCase().trim().replace(/\s+/g, '-'), kind, parent_id]
+    );
+    res.json(insert.rows[0]);
+  } catch (e) {
+    console.error('POST /projects failed', e);
+    res.status(500).json({ error: 'create failed' });
+  }
+});
+
+// Confirm a project by id OR name OR slug (any one)
+app.post('/projects/confirm', async (req, res) => {
+  try {
+    const { id, name, slug } = req.body || {};
+    const db = app.locals.db;
+
+    let proj = null;
+    if (id && db.getProjectById) proj = await db.getProjectById(id);
+    else if (name && db.findProjectByName) proj = await db.findProjectByName(name);
+    else if (slug && db.findProjectBySlug) proj = await db.findProjectBySlug(slug);
+
+    if (!proj) {
+      // SQL fallback find
+      let r;
+      if (id) r = await db._pool.query(`select * from projects where id=$1 limit 1`, [id]);
+      else if (name) r = await db._pool.query(`select * from projects where lower(name)=lower($1) limit 1`, [name]);
+      else if (slug) r = await db._pool.query(`select * from projects where slug=$1 limit 1`, [slug]);
+      proj = r?.rows?.[0] || null;
+    }
+    if (!proj) return res.status(404).json({ error: 'project not found' });
+
+    if (db.confirmProject) {
+      const c = await db.confirmProject(proj.id);
+      return res.json({ ok: true, project: c });
+    }
+
+    const upd = await db._pool.query(
+      `update projects set confirmed=true, require_confirmation=false where id=$1 returning *`,
+      [proj.id]
+    );
+    res.json({ ok: true, project: upd.rows[0] });
+  } catch (e) {
+    console.error('POST /projects/confirm failed', e);
+    res.status(500).json({ error: 'confirm failed' });
+  }
+});
+
 // --- Diagnostics route ---
 app.get('/__diag', async (req, res) => {
   try {

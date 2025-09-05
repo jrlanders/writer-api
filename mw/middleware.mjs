@@ -1,205 +1,304 @@
-// mw/middleware.mjs
+import { v4 as uuidv4, validate as uuidValidate } from "uuid";
 import express from "express";
-import { z } from "zod";
+import db from "./db.pg.mjs";
 
-// Exported factory that builds and returns the /mw router
-export function makeMiddleware({ baseUrl }) {
-  const mw = express.Router();
+const router = express.Router();
 
-  // Ensure JSON body parsing for all /mw routes
-  mw.use(express.json());
-
-  // ---- quick health probe so you can verify the mount ----
-  mw.get("/health", (req, res) => res.json({ ok: true, where: "middleware" }));
-
-  // --------- Schemas ----------
-  const structureSchema = z.object({
-    act: z.string().min(1),
-    section: z.union([z.number(), z.string()]).optional(),
-    chapter: z.union([z.number(), z.string()]).optional(),
-    scene: z.union([z.number(), z.string()]).optional()
-  });
-
-  const saveSceneSchema = z.object({
-    project_name: z.string().min(1),
-    title: z.string().min(1),
-    structure: structureSchema,
-    location: z.string().optional(),
-    start: z.string().optional(), // ISO string if provided
-    end: z.string().optional(),   // ISO string if provided
-    tags: z.array(z.string()).optional(),
-    notes_append: z.string().optional()
-  });
-
-  const enc = (v) => encodeURIComponent(v);
-
-  async function httpJson(url, opts = {}) {
-    const r = await fetch(url, {
-      ...opts,
-      headers: {
-        "accept": "application/json",
-        "content-type": "application/json",
-        ...(opts.headers || {})
-      }
-    });
-    const text = await r.text();
-    let json = null;
-    try { json = text ? JSON.parse(text) : null; } catch { /* leave json = null */ }
-    return { ok: r.ok, status: r.status, json, text };
-  }
-
-  const lyraReadByTitle = async (project_name, title) => {
-    const url = `${baseUrl}/lyra/read?project_name=${enc(project_name)}&title=${enc(title)}&ci=true`;
-    const { ok, status, json } = await httpJson(url);
-    if (status === 404) return null;
-    if (!ok) throw new Error(`lyraReadByTitle ${status}`);
-    return json.doc || (json.docs && json.docs[0]) || null;
-  };
-
-  const lyraReadByStructure = async (project_name, s) => {
-    const params = new URLSearchParams();
-    params.set("project_name", project_name);
-    params.set("doc_type", "scene");
-    if (s.act) params.set("meta.act", String(s.act));
-    if (s.section != null) params.set("meta.section", String(s.section));
-    if (s.chapter != null) params.set("meta.chapter", String(s.chapter));
-    if (s.scene != null) params.set("meta.scene", String(s.scene));
-    const url = `${baseUrl}/lyra/read?${params.toString()}`;
-    const { ok, status, json } = await httpJson(url);
-    if (status === 404) return null;
-    if (!ok) throw new Error(`lyraReadByStructure ${status}`);
-    return json.doc || (json.docs && json.docs[0]) || null;
-  };
-
-  const lyraPasteSave = async (payload) => {
-    const { ok, status, json, text } = await httpJson(`${baseUrl}/lyra/paste-save`, {
-      method: "POST",
-      body: JSON.stringify(payload)
-    });
-    if (!ok) throw new Error(`paste-save ${status}: ${text}`);
-    return json;
-  };
-
-  const makeTocPath = (s) => {
-    const parts = [];
-    if (s.act) parts.push(`Act ${s.act}`);
-    if (s.section != null) parts.push(`Section ${s.section}`);
-    if (s.chapter != null) parts.push(`Chapter ${s.chapter}`);
-    if (s.scene != null) parts.push(`Scene ${s.scene}`);
-    return parts.join(" > ");
-  };
-
-  // --------- Endpoints ----------
-
-  // Upsert a scene by title or structure; append notes if provided
-  mw.post("/save-scene", async (req, res) => {
-    try {
-      const args = saveSceneSchema.parse(req.body);
-      const { project_name, title, structure, location, start, end, tags = [], notes_append } = args;
-
-      // Resolve existing doc (prefer title; fallback to structure)
-      const existing =
-        (await lyraReadByTitle(project_name, title)) ||
-        (await lyraReadByStructure(project_name, structure));
-
-      const payload = {
-        project_name,
-        docMode: existing ? "update" : "create",
-        ...(existing && { id: existing.id }),
-        ...(notes_append && { sceneWriteMode: "append" }),
-        payload: {
-          doc_type: "scene",
-          title,
-          ...(notes_append ? { body_md: `\\n${notes_append}` } : {}),
-          tags: Array.from(new Set(["scene", ...(structure.act ? [`Act ${structure.act}`] : []), ...tags])),
-          meta: {
-            structure: {
-              act: structure.act,
-              ...(structure.section != null ? { section: Number(structure.section) || structure.section } : {}),
-              ...(structure.chapter != null ? { chapter: Number(structure.chapter) || structure.chapter } : {}),
-              ...(structure.scene != null ? { scene: String(structure.scene) } : {})
-            },
-            toc_path: makeTocPath(structure),
-            ...(location ? { location } : {}),
-            ...(start ? { start } : {}),
-            ...(end ? { end } : {})
-          }
-        }
-      };
-
-      const result = await lyraPasteSave(payload);
-      res.json({
-        ok: true,
-        mode: existing ? "update" : "create",
-        id: result.document_id || existing?.id || null,
-        title
-      });
-    } catch (e) {
-      res.status(400).json({ ok: false, error: String(e.message || e) });
+//
+// --- Validation Middleware ---
+//
+function validateUUID(field) {
+  return (req, res, next) => {
+    const value = req.params[field] || req.body[field];
+    if (value && !uuidValidate(value)) {
+      return res.status(400).json({ error: `Invalid UUID for ${field}` });
     }
-  });
-
-  // List scenes with optional filters
-  mw.get("/list-scenes", async (req, res) => {
-    try {
-      const { project_name, act, section, chapter } = req.query;
-      if (!project_name) return res.status(400).json({ ok: false, error: "project_name required" });
-
-      const params = new URLSearchParams({ project_name, doc_type: "scene" });
-      if (act) params.set("meta.act", String(act));
-      if (section) params.set("meta.section", String(section));
-      if (chapter) params.set("meta.chapter", String(chapter));
-
-      const r = await httpJson(`${baseUrl}/lyra/read?${params.toString()}`);
-      if (r.status === 404) return res.json({ ok: true, count: 0, scenes: [] });
-      if (!r.ok || !r.json) return res.status(502).json({ ok: false, error: `upstream ${r.status}` });
-
-      const docs = r.json.docs || (r.json.doc ? [r.json.doc] : []);
-      const scenes = docs.map(d => ({
-        id: d.id,
-        title: d.title,
-        structure: d.meta?.structure || null,
-        location: d.meta?.location || null
-      }));
-      res.json({ ok: true, count: scenes.length, scenes });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: "list-scenes failed" });
-    }
-  });
-
-  // Compute a Scenes TOC on the fly (no stored doc required)
-  mw.get("/toc/scenes", async (req, res) => {
-    try {
-      const { project_name } = req.query;
-      if (!project_name) return res.status(400).json({ ok: false, error: "project_name required" });
-
-      const r = await httpJson(`${baseUrl}/lyra/read?project_name=${enc(project_name)}&doc_type=scene`);
-      if (r.status === 404) return res.json({ ok: true, count: 0, lines: [] });
-      if (!r.ok || !r.json) return res.status(502).json({ ok: false, error: `upstream ${r.status}`, body: r.text?.slice(0,400) });
-
-      const docs = r.json.docs || (r.json.doc ? [r.json.doc] : []);
-      const ordered = docs.sort((a, b) => {
-        const A = a.meta?.structure || {}, B = b.meta?.structure || {};
-        const k = x => [x.act || "", x.section || 0, x.chapter || 0, String(x.scene ?? "")];
-        return k(A).join("|").localeCompare(k(B).join("|"), "en", { numeric: true });
-      });
-
-      const lines = ordered.map(d => {
-        const s = d.meta?.structure || {};
-        const path = [
-          s.act && `Act ${s.act}`,
-          s.section != null && `Section ${s.section}`,
-          s.chapter != null && `Chapter ${s.chapter}`,
-          s.scene != null && `Scene ${s.scene}`
-        ].filter(Boolean).join(" > ");
-        return `${path} — ${d.title} (${d.id})`;
-      });
-
-      res.json({ ok: true, count: lines.length, lines });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: "toc scenes failed" });
-    }
-  });
-
-  return mw;
+    next();
+  };
 }
+
+function requireFields(fields) {
+  return (req, res, next) => {
+    for (const f of fields) {
+      if (!req.body[f]) {
+        return res.status(400).json({ error: `Missing required field: ${f}` });
+      }
+    }
+    next();
+  };
+}
+
+function normalizeBody(req, res, next) {
+  if (req.body.body_md && !req.body.body) {
+    req.body.body = req.body.body_md;
+    delete req.body.body_md;
+  }
+  next();
+}
+
+//
+// --- Utility Queries ---
+//
+async function query(sql, params) {
+  const { rows } = await db.query(sql, params);
+  return rows;
+}
+
+//
+// --- Series ---
+//
+router.get("/series", async (req, res) => {
+  res.json(await query("SELECT * FROM writing.series ORDER BY created_at"));
+});
+
+router.post("/series", requireFields(["title"]), async (req, res) => {
+  const id = uuidv4();
+  await query(
+    `INSERT INTO writing.series (id, title, synopsis) VALUES ($1, $2, $3)`,
+    [id, req.body.title, req.body.synopsis || null]
+  );
+  res.json({ id });
+});
+
+//
+// --- Books ---
+//
+router.get("/books", async (req, res) => {
+  res.json(await query("SELECT * FROM writing.books ORDER BY created_at"));
+});
+
+router.post(
+  "/books",
+  requireFields(["series_id", "title"]),
+  validateUUID("series_id"),
+  async (req, res) => {
+    const id = uuidv4();
+    await query(
+      `INSERT INTO writing.books (id, series_id, title, synopsis) VALUES ($1, $2, $3, $4)`,
+      [id, req.body.series_id, req.body.title, req.body.synopsis || null]
+    );
+    res.json({ id });
+  }
+);
+
+//
+// --- Acts / Sections / Chapters / Scenes ---
+//
+router.get("/acts/:book_id", validateUUID("book_id"), async (req, res) => {
+  res.json(
+    await query("SELECT * FROM writing.acts WHERE book_id=$1", [req.params.book_id])
+  );
+});
+
+router.post(
+  "/acts",
+  requireFields(["book_id", "act_number"]),
+  validateUUID("book_id"),
+  async (req, res) => {
+    const id = uuidv4();
+    await query(
+      `INSERT INTO writing.acts (id, book_id, act_number, synopsis)
+       VALUES ($1, $2, $3, $4)`,
+      [id, req.body.book_id, req.body.act_number, req.body.synopsis || null]
+    );
+    res.json({ id });
+  }
+);
+
+// Sections
+router.get("/sections/:act_id", validateUUID("act_id"), async (req, res) => {
+  res.json(
+    await query("SELECT * FROM writing.sections WHERE act_id=$1", [req.params.act_id])
+  );
+});
+
+router.post(
+  "/sections",
+  requireFields(["act_id", "section_number"]),
+  validateUUID("act_id"),
+  async (req, res) => {
+    const id = uuidv4();
+    await query(
+      `INSERT INTO writing.sections (id, act_id, section_number, name, synopsis)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        id,
+        req.body.act_id,
+        req.body.section_number,
+        req.body.name || null,
+        req.body.synopsis || null,
+      ]
+    );
+    res.json({ id });
+  }
+);
+
+// Chapters
+router.get("/chapters/:section_id", validateUUID("section_id"), async (req, res) => {
+  res.json(
+    await query("SELECT * FROM writing.chapters WHERE section_id=$1", [
+      req.params.section_id,
+    ])
+  );
+});
+
+router.post(
+  "/chapters",
+  requireFields(["section_id", "chapter_number"]),
+  validateUUID("section_id"),
+  async (req, res) => {
+    const id = uuidv4();
+    await query(
+      `INSERT INTO writing.chapters (id, section_id, chapter_number, title, synopsis)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [id, req.body.section_id, req.body.chapter_number, req.body.title || null, req.body.synopsis || null]
+    );
+    res.json({ id });
+  }
+);
+
+// Scenes
+router.get("/scenes/:chapter_id", validateUUID("chapter_id"), async (req, res) => {
+  res.json(
+    await query("SELECT * FROM writing.scenes WHERE chapter_id=$1", [
+      req.params.chapter_id,
+    ])
+  );
+});
+
+router.post(
+  "/scenes",
+  requireFields(["chapter_id", "scene_number", "title"]),
+  [validateUUID("chapter_id"), normalizeBody],
+  async (req, res) => {
+    const id = uuidv4();
+    await query(
+      `INSERT INTO writing.scenes (id, chapter_id, scene_number, title, synopsis, body, start_datetime, end_datetime)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        id,
+        req.body.chapter_id,
+        req.body.scene_number,
+        req.body.title,
+        req.body.synopsis || null,
+        req.body.body || "",
+        req.body.start_datetime || null,
+        req.body.end_datetime || null,
+      ]
+    );
+    res.json({ id });
+  }
+);
+
+//
+// --- Characters ---
+//
+router.get("/characters/:book_id", validateUUID("book_id"), async (req, res) => {
+  res.json(
+    await query("SELECT * FROM writing.characters WHERE book_id=$1", [
+      req.params.book_id,
+    ])
+  );
+});
+
+router.post(
+  "/characters",
+  requireFields(["book_id", "name"]),
+  [validateUUID("book_id"), normalizeBody],
+  async (req, res) => {
+    const id = uuidv4();
+    await query(
+      `INSERT INTO writing.characters (id, book_id, name, biography, aliases)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [id, req.body.book_id, req.body.name, req.body.body || "", req.body.aliases || []]
+    );
+    res.json({ id });
+  }
+);
+
+//
+// --- Concepts / Lore / Artifacts / Index ---
+//
+router.get("/concepts/:book_id", validateUUID("book_id"), async (req, res) => {
+  res.json(
+    await query("SELECT * FROM writing.concepts WHERE book_id=$1", [
+      req.params.book_id,
+    ])
+  );
+});
+
+router.post(
+  "/concepts",
+  requireFields(["book_id", "title"]),
+  [validateUUID("book_id"), normalizeBody],
+  async (req, res) => {
+    const id = uuidv4();
+    await query(
+      `INSERT INTO writing.concepts (id, book_id, doc_type, title, body, tags, meta)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        id,
+        req.body.book_id,
+        req.body.doc_type || "concept",
+        req.body.title,
+        req.body.body || "",
+        req.body.tags || [],
+        req.body.meta || {},
+      ]
+    );
+    res.json({ id });
+  }
+);
+
+//
+// --- Misc ---
+//
+router.get("/misc/:book_id", validateUUID("book_id"), async (req, res) => {
+  res.json(
+    await query("SELECT * FROM writing.misc WHERE book_id=$1", [req.params.book_id])
+  );
+});
+
+router.post(
+  "/misc",
+  requireFields(["book_id", "doc_type", "title"]),
+  [validateUUID("book_id"), normalizeBody],
+  async (req, res) => {
+    const id = uuidv4();
+    await query(
+      `INSERT INTO writing.misc (id, book_id, doc_type, title, body, tags, meta)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        id,
+        req.body.book_id,
+        req.body.doc_type,
+        req.body.title,
+        req.body.body || "",
+        req.body.tags || [],
+        req.body.meta || {},
+      ]
+    );
+    res.json({ id });
+  }
+);
+
+//
+// --- Search ---
+//
+router.get("/search", async (req, res) => {
+  const q = `%${req.query.q || ""}%`;
+  const results = await query(
+    `
+    SELECT 'concept' AS type, id, title, body FROM writing.concepts WHERE title ILIKE $1 OR body ILIKE $1
+    UNION
+    SELECT 'character', id, name, biography FROM writing.characters WHERE name ILIKE $1 OR biography ILIKE $1
+    UNION
+    SELECT 'misc', id, title, body FROM writing.misc WHERE title ILIKE $1 OR body ILIKE $1
+    LIMIT 50
+    `,
+    [q]
+  );
+  res.json(results);
+});
+
+export default router;

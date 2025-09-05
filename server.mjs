@@ -1,136 +1,109 @@
 // server.mjs
 import express from "express";
 import bodyParser from "body-parser";
-import cors from "cors";
 import {
-  createDoc,
-  updateDoc,
-  listDocs,
-  getDoc,
-  deleteDoc,
+  readDocs,
   searchDocs,
-  exportAll,
-} from "./db.pg.mjs";
+  exportProject,
+  saveDoc,
+} from "./db.pg.mjs"; // assumes db.pg.mjs exports these
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
 app.use(bodyParser.json());
 
-// --- Routes ---
-
-// Health check
+// --- Health Check ---
 app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
+  res.json({ status: "ok", service: "Lyra API" });
 });
 
-// List all docs
-app.get("/docs", async (req, res) => {
+// --- READ (by title, id, tags, or doc_type) ---
+app.get("/lyra/read", async (req, res) => {
   try {
-    const docs = await listDocs();
+    const { project_name, id, title, doc_type, tags, ci } = req.query;
+    const docs = await readDocs({
+      project_name,
+      id,
+      title,
+      doc_type,
+      tags,
+      ci: ci === "true",
+    });
     res.json(docs);
   } catch (err) {
-    console.error("Error listing docs:", err);
-    res.status(500).json({ error: "Failed to list docs" });
+    console.error("❌ Error in /lyra/read:", err);
+    res.status(500).json({ error: "Failed to read docs" });
   }
 });
 
-// Get one doc
-app.get("/docs/:id", async (req, res) => {
+// --- SEARCH (full-text) ---
+app.get("/lyra/search", async (req, res) => {
   try {
-    const doc = await getDoc(req.params.id);
-    if (!doc) return res.status(404).json({ error: "Not found" });
-    res.json(doc);
-  } catch (err) {
-    console.error("Error getting doc:", err);
-    res.status(500).json({ error: "Failed to fetch doc" });
-  }
-});
-
-// Create a new doc
-app.post("/docs", async (req, res) => {
-  try {
-    const result = await createDoc(req.body);
-    res.json(result);
-  } catch (err) {
-    console.error("Error creating doc:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Update a doc
-app.put("/docs/:id", async (req, res) => {
-  try {
-    const result = await updateDoc(req.params.id, req.body);
-    res.json(result);
-  } catch (err) {
-    console.error("Error updating doc:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Delete a doc
-app.delete("/docs/:id", async (req, res) => {
-  try {
-    const result = await deleteDoc(req.params.id);
-    res.json(result);
-  } catch (err) {
-    console.error("Error deleting doc:", err);
-    res.status(500).json({ error: "Failed to delete doc" });
-  }
-});
-
-// Search docs
-app.get("/search", async (req, res) => {
-  try {
-    const term = req.query.q;
-    if (!term) return res.status(400).json({ error: "Missing query param q" });
-    const results = await searchDocs(term);
+    const { project_name, q, limit } = req.query;
+    const results = await searchDocs({
+      project_name,
+      q,
+      limit: limit ? parseInt(limit, 10) : 20,
+    });
     res.json(results);
   } catch (err) {
-    console.error("Error searching docs:", err);
-    res.status(500).json({ error: "Failed to search" });
+    console.error("❌ Error in /lyra/search:", err);
+    res.status(500).json({ error: "Failed to search docs" });
   }
 });
 
-// Export all docs
+// --- EXPORT (all docs for a project) ---
 app.get("/export", async (req, res) => {
   try {
-    const all = await exportAll();
-    res.json(all);
+    const { project_name } = req.query;
+    const json = await exportProject({ project_name });
+    res.setHeader("Content-Type", "application/json");
+    res.send(json);
   } catch (err) {
-    console.error("Error exporting docs:", err);
-    res.status(500).json({ error: "Failed to export" });
+    console.error("❌ Error in /export:", err);
+    res.status(500).json({ error: "Failed to export project" });
   }
 });
 
-// Import docs (bulk load)
-app.post("/import", async (req, res) => {
+// --- WRITE (create/update/append) ---
+app.post("/lyra/paste-save", async (req, res) => {
   try {
-    if (!Array.isArray(req.body)) {
-      return res.status(400).json({ error: "Expected an array of docs" });
+    const {
+      project_name,
+      docMode = "create",
+      sceneWriteMode = "overwrite",
+      id,
+      payload,
+    } = req.body;
+
+    if (!project_name || !payload?.doc_type || !payload?.title) {
+      return res
+        .status(400)
+        .json({ error: "Missing required fields: project_name, doc_type, title" });
     }
 
-    const results = [];
-    for (const doc of req.body) {
-      try {
-        const result = await createDoc(doc);
-        results.push({ id: doc.id || null, status: "ok", result });
-      } catch (err) {
-        console.error("Error importing doc:", doc.title || doc.id, err);
-        results.push({ id: doc.id || null, status: "error", error: err.message });
-      }
-    }
+    const result = await saveDoc({
+      project_name,
+      docMode,
+      sceneWriteMode,
+      id,
+      payload,
+    });
 
-    res.json({ imported: results.length, results });
+    res.json({ success: true, result });
   } catch (err) {
-    console.error("Error importing docs:", err);
-    res.status(500).json({ error: "Failed to import" });
+    console.error("❌ Error in /lyra/paste-save:", err);
+    res.status(500).json({ error: "Failed to save doc" });
   }
 });
 
-// --- Start server ---
+// --- Fallback ---
+app.use((req, res) => {
+  res.status(404).json({ error: `Route not found: ${req.method} ${req.url}` });
+});
+
+// --- Start ---
 app.listen(PORT, () => {
-  console.log(`✅ Server listening on http://localhost:${PORT}`);
+  console.log(`🚀 Lyra API server running on port ${PORT}`);
 });

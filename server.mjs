@@ -45,19 +45,6 @@ function validateRequest(reqBody) {
   return null; // valid
 }
 
-// --- Normalize fields ---
-function normalizePayload(payload) {
-  // ✅ Ensure tags is always an array
-  if (!Array.isArray(payload.payload.tags)) {
-    payload.payload.tags = [];
-  }
-  // ✅ Ensure meta is always an object
-  if (!payload.payload.meta || typeof payload.payload.meta !== "object") {
-    payload.payload.meta = {};
-  }
-  return payload;
-}
-
 // --- Routes ---
 
 // Health check
@@ -106,8 +93,7 @@ async function handleSave(req, res) {
       return res.status(400).json({ error: `Invalid request: ${validationError}` });
     }
 
-    let payload = normalizePayload(req.body); // ✅ normalize tags/meta
-
+    let payload = req.body; // ✅ now mutable
     const baseId = payload.id || uuidv4();
     const bodyText = payload.payload.body_md || "";
 
@@ -126,7 +112,6 @@ async function handleSave(req, res) {
             body_md: parts[idx],
           },
         };
-        partPayload = normalizePayload(partPayload); // ✅ normalize each part
         const result = await createOrUpdateDoc(partPayload.id, partPayload);
         savedParts.push(result);
       }

@@ -15,47 +15,75 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// ✅ Allow large scenes up to ~20MB
+app.use(express.json({ limit: "20mb" }));
 
-// Health check
+// --- Helper: split long docs into parts ---
+function splitBodyText(text, maxLen = 10000) {
+  if (!text || text.length <= maxLen) return [text];
+  const parts = [];
+  for (let i = 0; i < text.length; i += maxLen) {
+    parts.push(text.slice(i, i + maxLen));
+  }
+  return parts;
+}
+
+// --- Helper: reassemble parts back into one ---
+function mergeDocs(docs) {
+  const grouped = {};
+  for (const doc of docs) {
+    // Detect part suffix: id-partN
+    const baseId = doc.id.split("-part")[0];
+    if (!grouped[baseId]) {
+      grouped[baseId] = { ...doc, body: "" };
+    }
+    grouped[baseId].body += doc.body || "";
+  }
+  return Object.values(grouped);
+}
+
+// --- HEALTH ---
 app.get("/health", (req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
 });
 
-// Read documents (preferred route)
+// --- READ ---
 app.get("/lyra/read", async (req, res) => {
   try {
     const docs = await lyraRead(req.query);
-    res.json(docs);
+    const merged = mergeDocs(docs);
+    res.json(merged);
   } catch (err) {
     console.error("❌ /lyra/read error", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Failed to read docs", details: err.message });
   }
 });
 
-// Alias: GET /doc → same as /lyra/read
+// Alias: GET /doc
 app.get("/doc", async (req, res) => {
   try {
     const docs = await lyraRead(req.query);
-    res.json(docs);
+    const merged = mergeDocs(docs);
+    res.json(merged);
   } catch (err) {
     console.error("❌ /doc error", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Failed to read docs", details: err.message });
   }
 });
 
-// Search documents
+// --- SEARCH ---
 app.get("/search", async (req, res) => {
   try {
     const results = await searchDocs(req.query);
-    res.json(results);
+    const merged = mergeDocs(results);
+    res.json(merged);
   } catch (err) {
     console.error("❌ /search error", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Search failed", details: err.message });
   }
 });
 
-// Paste-save (create or update)
+// --- PASTE-SAVE ---
 app.post("/lyra/paste-save", async (req, res) => {
   try {
     const payload = req.body;
@@ -64,15 +92,37 @@ app.post("/lyra/paste-save", async (req, res) => {
     }
 
     const id = payload.id || uuidv4();
-    const result = await createOrUpdateDoc(id, payload);
-    res.json({ id, result });
+    const bodyText = payload.payload.body_md || "";
+    const parts = splitBodyText(bodyText);
+
+    let result;
+    if (parts.length === 1) {
+      result = await createOrUpdateDoc(id, payload);
+    } else {
+      console.log(`✂️ Splitting doc ${id} into ${parts.length} parts due to size`);
+      let lastResult;
+      for (let i = 0; i < parts.length; i++) {
+        const partPayload = {
+          ...payload,
+          payload: {
+            ...payload.payload,
+            body_md: parts[i],
+            title: i === 0 ? payload.payload.title : `${payload.payload.title} (Part ${i + 1})`,
+          },
+        };
+        lastResult = await createOrUpdateDoc(id + `-part${i + 1}`, partPayload);
+      }
+      result = lastResult;
+    }
+
+    res.json({ id, result, parts: parts.length });
   } catch (err) {
     console.error("❌ /lyra/paste-save error", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Failed to save document", details: err.message });
   }
 });
 
-// Alias: POST /doc → same as /lyra/paste-save
+// Alias: POST /doc
 app.post("/doc", async (req, res) => {
   try {
     const payload = req.body;
@@ -81,22 +131,45 @@ app.post("/doc", async (req, res) => {
     }
 
     const id = payload.id || uuidv4();
-    const result = await createOrUpdateDoc(id, payload);
-    res.json({ id, result });
+    const bodyText = payload.payload.body_md || "";
+    const parts = splitBodyText(bodyText);
+
+    let result;
+    if (parts.length === 1) {
+      result = await createOrUpdateDoc(id, payload);
+    } else {
+      console.log(`✂️ Splitting doc ${id} into ${parts.length} parts due to size`);
+      let lastResult;
+      for (let i = 0; i < parts.length; i++) {
+        const partPayload = {
+          ...payload,
+          payload: {
+            ...payload.payload,
+            body_md: parts[i],
+            title: i === 0 ? payload.payload.title : `${payload.payload.title} (Part ${i + 1})`,
+          },
+        };
+        lastResult = await createOrUpdateDoc(id + `-part${i + 1}`, partPayload);
+      }
+      result = lastResult;
+    }
+
+    res.json({ id, result, parts: parts.length });
   } catch (err) {
     console.error("❌ /doc POST error", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Failed to save document", details: err.message });
   }
 });
 
-// Export all docs
+// --- EXPORT ---
 app.get("/export", async (req, res) => {
   try {
     const data = await exportProject(req.query.project_name);
-    res.json(data);
+    const merged = mergeDocs(data.docs);
+    res.json({ docs: merged });
   } catch (err) {
     console.error("❌ /export error", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Failed to export project", details: err.message });
   }
 });
 

@@ -20,96 +20,38 @@ async function query(text, params) {
   }
 }
 
-// --- Helper: split oversized text ---
-function splitText(text, maxLen = 8000) {
-  const parts = [];
-  let i = 0;
-  while (i < text.length) {
-    parts.push(text.slice(i, i + maxLen));
-    i += maxLen;
-  }
-  return parts;
-}
-
-// --- Helper: merge split docs ---
-function mergeParts(rows) {
-  const grouped = {};
-
-  for (const row of rows) {
-    const baseId = row.id.includes("-p") ? row.id.split("-p")[0] : row.id;
-
-    if (!grouped[baseId]) {
-      grouped[baseId] = { ...row, id: baseId, body: "" };
-    }
-
-    grouped[baseId].body += row.body || "";
-  }
-
-  return Object.values(grouped);
-}
-
 // --- Create Doc ---
 export async function createDoc(project_name, payload, topLevel = {}) {
   const id = payload.id || uuidv4();
 
-  const tags = payload.tags || topLevel.tags || [];
-  const meta = payload.meta || topLevel.meta || {};
+  // Normalize optional fields — only pass if present
+  const doc_type = payload.doc_type;
+  const title = payload.title;
   const body = payload.body_md || "";
+  const tags =
+    payload.tags || topLevel.tags ? JSON.stringify(payload.tags || topLevel.tags) : null;
+  const meta =
+    payload.meta || topLevel.meta ? JSON.stringify(payload.meta || topLevel.meta) : null;
 
-  // ✅ Oversized: split into parts
-  if (body.length > 8000) {
-    const parts = splitText(body);
-    const savedParts = [];
-
-    for (let idx = 0; idx < parts.length; idx++) {
-      const partId = `${id}-p${idx + 1}`;
-      const partResult = await query(
-        `
-        INSERT INTO writing.misc (id, book_id, doc_type, title, body, tags, meta)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (id) DO UPDATE
-        SET title = EXCLUDED.title,
-            body = EXCLUDED.body,
-            tags = EXCLUDED.tags,
-            meta = EXCLUDED.meta
-        RETURNING *;
-        `,
-        [
-          partId,
-          "00000000-0000-0000-0000-000000000001",
-          payload.doc_type,
-          `${payload.title} (Part ${idx + 1})`,
-          parts[idx],
-          JSON.stringify(tags),
-          JSON.stringify(meta),
-        ]
-      );
-      savedParts.push(partResult.rows[0]);
-    }
-
-    return { id, parts: savedParts.length, results: savedParts };
-  }
-
-  // ✅ Normal insert
   const result = await query(
     `
     INSERT INTO writing.misc (id, book_id, doc_type, title, body, tags, meta)
-    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    VALUES ($1, $2, $3, $4, $5, COALESCE($6, DEFAULT), COALESCE($7, DEFAULT))
     ON CONFLICT (id) DO UPDATE
     SET title = EXCLUDED.title,
         body = EXCLUDED.body,
-        tags = EXCLUDED.tags,
-        meta = EXCLUDED.meta
+        tags = COALESCE(EXCLUDED.tags, writing.misc.tags),
+        meta = COALESCE(EXCLUDED.meta, writing.misc.meta)
     RETURNING *;
     `,
     [
       id,
-      "00000000-0000-0000-0000-000000000001",
-      payload.doc_type,
-      payload.title,
+      "00000000-0000-0000-0000-000000000001", // default book_id
+      doc_type,
+      title,
       body,
-      JSON.stringify(tags),
-      JSON.stringify(meta),
+      tags,
+      meta,
     ]
   );
 
@@ -144,6 +86,8 @@ export async function updateDoc(project_name, id, payload, sceneWriteMode) {
     values.push(JSON.stringify(payload.meta));
   }
 
+  if (fields.length === 0) return null;
+
   updateSql += fields.join(", ") + ` WHERE id = $${i} RETURNING *`;
   values.push(id);
 
@@ -177,9 +121,7 @@ export async function readDocs(filters = {}) {
   }
 
   const result = await query(sql, values);
-
-  // ✅ Merge split docs into full scenes
-  return mergeParts(result.rows);
+  return result.rows;
 }
 
 // --- Search Docs ---
@@ -193,9 +135,7 @@ export async function searchDocs(filters = {}) {
     `,
     [`%${q}%`]
   );
-
-  // ✅ Merge split docs so search results show full scenes
-  return mergeParts(result.rows);
+  return result.rows;
 }
 
 // --- Export Project ---
@@ -204,7 +144,5 @@ export async function exportProject(project_name) {
     `SELECT * FROM writing.misc ORDER BY updated_at DESC`,
     []
   );
-
-  // ✅ Merge split docs so export has whole docs
-  return { docs: mergeParts(result.rows) };
+  return { docs: result.rows };
 }

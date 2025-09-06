@@ -21,8 +21,12 @@ async function query(text, params) {
 }
 
 // --- Create Doc ---
-export async function createDoc(project_name, payload) {
+export async function createDoc(project_name, payload, topLevel = {}) {
   const id = payload.id || uuidv4();
+
+  // ✅ Normalize tags and meta from payload or top-level
+  const tags = payload.tags || topLevel.tags || [];
+  const meta = payload.meta || topLevel.meta || {};
 
   const result = await query(
     `
@@ -41,8 +45,8 @@ export async function createDoc(project_name, payload) {
       payload.doc_type,
       payload.title,
       payload.body_md || "",
-      JSON.stringify(payload.tags || []),
-      JSON.stringify(payload.meta || {}),
+      JSON.stringify(tags),
+      JSON.stringify(meta),
     ]
   );
 
@@ -86,12 +90,12 @@ export async function updateDoc(project_name, id, payload, sceneWriteMode) {
 
 // --- Create or Update Doc ---
 export async function createOrUpdateDoc(id, request) {
-  const { project_name, docMode, sceneWriteMode, payload } = request;
+  const { project_name, docMode, sceneWriteMode, payload, ...topLevel } = request;
 
   if (docMode === "update") {
     return updateDoc(project_name, id, payload, sceneWriteMode);
   }
-  return createDoc(project_name, payload);
+  return createDoc(project_name, payload, topLevel);
 }
 
 // --- Read Docs ---
@@ -129,6 +133,9 @@ export async function searchDocs(filters = {}) {
 
 // --- Export Project ---
 export async function exportProject(project_name) {
-  const result = await query(`SELECT * FROM writing.misc ORDER BY updated_at DESC`, []);
+  const result = await query(
+    `SELECT * FROM writing.misc ORDER BY updated_at DESC`,
+    []
+  );
   return { docs: result.rows };
 }

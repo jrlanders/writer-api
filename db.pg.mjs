@@ -84,6 +84,16 @@ export async function updateDoc(project_name, id, payload, sceneWriteMode) {
   return result.rows[0];
 }
 
+// --- Create or Update Doc ---
+export async function createOrUpdateDoc(id, request) {
+  const { project_name, docMode, sceneWriteMode, payload } = request;
+
+  if (docMode === "update") {
+    return updateDoc(project_name, id, payload, sceneWriteMode);
+  }
+  return createDoc(project_name, payload);
+}
+
 // --- Read Docs ---
 export async function readDocs(filters = {}) {
   let sql = `SELECT * FROM writing.misc WHERE 1=1`;

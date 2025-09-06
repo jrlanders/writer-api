@@ -129,6 +129,6 @@ export async function searchDocs(filters = {}) {
 
 // --- Export Project ---
 export async function exportProject(project_name) {
-  const result = await query(`SELECT * FROM writing.misc`, []);
+  const result = await query(`SELECT * FROM writing.misc ORDER BY updated_at DESC`, []);
   return { docs: result.rows };
 }

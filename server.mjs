@@ -15,7 +15,7 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "5mb" })); // ✅ higher body size limit
+app.use(express.json({ limit: "5mb" })); // ✅ raise JSON body size limit
 
 // --- Helper: split oversized text ---
 function splitText(text, maxLen = 8000) {
@@ -26,6 +26,22 @@ function splitText(text, maxLen = 8000) {
     i += maxLen;
   }
   return parts;
+}
+
+// --- Normalize incoming request ---
+function normalizeRequest(body) {
+  if (!body) return null;
+
+  // If request already has a `payload` field → fine
+  if (body.payload) {
+    return body;
+  }
+
+  // Otherwise, wrap everything inside payload
+  return {
+    ...body,
+    payload: { ...body },
+  };
 }
 
 // --- Validate request structure ---
@@ -43,20 +59,6 @@ function validateRequest(reqBody) {
     return "Missing payload.title";
   }
   return null; // valid
-}
-
-// --- Sanitize payload (normalize tags & meta) ---
-function sanitizePayload(payload) {
-  return {
-    ...payload,
-    payload: {
-      ...payload.payload,
-      tags: Array.isArray(payload.payload.tags) ? payload.payload.tags : [],
-      meta: typeof payload.payload.meta === "object" && payload.payload.meta !== null
-        ? payload.payload.meta
-        : {},
-    },
-  };
 }
 
 // --- Routes ---
@@ -99,20 +101,21 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// Core save handler
+// --- Core save handler (shared by /lyra/paste-save and /doc POST) ---
 async function handleSave(req, res) {
   try {
-    const validationError = validateRequest(req.body);
+    const normalized = normalizeRequest(req.body);
+    const validationError = validateRequest(normalized);
+
     if (validationError) {
       return res.status(400).json({ error: `Invalid request: ${validationError}` });
     }
 
-    // ✅ sanitize input before DB
-    const payload = sanitizePayload(req.body);
+    const payload = normalized;
     const baseId = payload.id || uuidv4();
     const bodyText = payload.payload.body_md || "";
 
-    // Split oversized text
+    // If scene body is oversized → split into parts
     if (bodyText.length > 8000) {
       const parts = splitText(bodyText);
       const savedParts = [];

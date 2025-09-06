@@ -33,7 +33,7 @@ app.get("/lyra/read", async (req, res) => {
   }
 });
 
-// Alias: /doc → same as /lyra/read
+// Alias: GET /doc → same as /lyra/read
 app.get("/doc", async (req, res) => {
   try {
     const docs = await lyraRead(req.query);
@@ -68,6 +68,23 @@ app.post("/lyra/paste-save", async (req, res) => {
     res.json({ id, result });
   } catch (err) {
     console.error("❌ /lyra/paste-save error", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Alias: POST /doc → same as /lyra/paste-save
+app.post("/doc", async (req, res) => {
+  try {
+    const payload = req.body;
+    if (!payload || !payload.payload) {
+      return res.status(400).json({ error: "Invalid request: missing payload" });
+    }
+
+    const id = payload.id || uuidv4();
+    const result = await createOrUpdateDoc(id, payload);
+    res.json({ id, result });
+  } catch (err) {
+    console.error("❌ /doc POST error", err);
     res.status(500).json({ error: err.message });
   }
 });

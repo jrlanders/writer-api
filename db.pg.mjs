@@ -24,34 +24,29 @@ async function query(text, params) {
 export async function createDoc(project_name, payload, topLevel = {}) {
   const id = payload.id || uuidv4();
 
-  // Normalize optional fields — only pass if present
-  const doc_type = payload.doc_type;
-  const title = payload.title;
-  const body = payload.body_md || "";
-  const tags =
-    payload.tags || topLevel.tags ? JSON.stringify(payload.tags || topLevel.tags) : null;
-  const meta =
-    payload.meta || topLevel.meta ? JSON.stringify(payload.meta || topLevel.meta) : null;
+  // ✅ Normalize tags and meta
+  const tags = payload.tags || topLevel.tags || [];
+  const meta = payload.meta || topLevel.meta || {};
 
   const result = await query(
     `
     INSERT INTO writing.misc (id, book_id, doc_type, title, body, tags, meta)
-    VALUES ($1, $2, $3, $4, $5, COALESCE($6, DEFAULT), COALESCE($7, DEFAULT))
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
     ON CONFLICT (id) DO UPDATE
     SET title = EXCLUDED.title,
         body = EXCLUDED.body,
-        tags = COALESCE(EXCLUDED.tags, writing.misc.tags),
-        meta = COALESCE(EXCLUDED.meta, writing.misc.meta)
+        tags = EXCLUDED.tags,
+        meta = EXCLUDED.meta
     RETURNING *;
     `,
     [
       id,
       "00000000-0000-0000-0000-000000000001", // default book_id
-      doc_type,
-      title,
-      body,
-      tags,
-      meta,
+      payload.doc_type,
+      payload.title || "Untitled",
+      payload.body_md || "",
+      JSON.stringify(tags || []),
+      JSON.stringify(meta || {}),
     ]
   );
 
@@ -71,22 +66,24 @@ export async function updateDoc(project_name, id, payload, sceneWriteMode) {
   }
   if (payload.body_md) {
     if (sceneWriteMode === "append") {
-      fields.push(`body = COALESCE(body, '') || $${i++}`);
+      fields.push(`body = COALESCE(body, '') || '\n' || $${i++}`);
     } else {
       fields.push(`body = $${i++}`);
     }
     values.push(payload.body_md);
   }
   if (payload.tags) {
-    fields.push(`tags = $${i++}`);
+    fields.push(`tags = COALESCE($${i++}::jsonb, tags)`);
     values.push(JSON.stringify(payload.tags));
   }
   if (payload.meta) {
-    fields.push(`meta = $${i++}`);
+    fields.push(`meta = COALESCE($${i++}::jsonb, meta)`);
     values.push(JSON.stringify(payload.meta));
   }
 
-  if (fields.length === 0) return null;
+  if (fields.length === 0) {
+    throw new Error("No fields to update");
+  }
 
   updateSql += fields.join(", ") + ` WHERE id = $${i} RETURNING *`;
   values.push(id);
@@ -117,8 +114,10 @@ export async function readDocs(filters = {}) {
   }
   if (filters.title) {
     sql += ` AND title ILIKE $${i++}`;
-    values.push(filters.title);
+    values.push(`%${filters.title}%`);
   }
+
+  sql += ` ORDER BY updated_at DESC`;
 
   const result = await query(sql, values);
   return result.rows;
@@ -130,7 +129,10 @@ export async function searchDocs(filters = {}) {
   const result = await query(
     `
     SELECT * FROM writing.misc
-    WHERE title ILIKE $1 OR body ILIKE $1
+    WHERE title ILIKE $1
+       OR body ILIKE $1
+       OR tags::text ILIKE $1
+       OR meta::text ILIKE $1
     ORDER BY updated_at DESC
     `,
     [`%${q}%`]
@@ -138,7 +140,7 @@ export async function searchDocs(filters = {}) {
   return result.rows;
 }
 
-// --- Export Project ---
+// --- Export Project (misc only for now) ---
 export async function exportProject(project_name) {
   const result = await query(
     `SELECT * FROM writing.misc ORDER BY updated_at DESC`,

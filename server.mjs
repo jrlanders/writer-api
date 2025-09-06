@@ -15,7 +15,7 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "5mb" })); // ✅ raise JSON body size limit
+app.use(express.json({ limit: "5mb" })); // ✅ higher body size limit
 
 // --- Helper: split oversized text ---
 function splitText(text, maxLen = 8000) {
@@ -43,6 +43,20 @@ function validateRequest(reqBody) {
     return "Missing payload.title";
   }
   return null; // valid
+}
+
+// --- Sanitize payload (normalize tags & meta) ---
+function sanitizePayload(payload) {
+  return {
+    ...payload,
+    payload: {
+      ...payload.payload,
+      tags: Array.isArray(payload.payload.tags) ? payload.payload.tags : [],
+      meta: typeof payload.payload.meta === "object" && payload.payload.meta !== null
+        ? payload.payload.meta
+        : {},
+    },
+  };
 }
 
 // --- Routes ---
@@ -85,7 +99,7 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// Core save handler (shared by /lyra/paste-save and /doc POST)
+// Core save handler
 async function handleSave(req, res) {
   try {
     const validationError = validateRequest(req.body);
@@ -93,11 +107,12 @@ async function handleSave(req, res) {
       return res.status(400).json({ error: `Invalid request: ${validationError}` });
     }
 
-    let payload = req.body; // ✅ now mutable
+    // ✅ sanitize input before DB
+    const payload = sanitizePayload(req.body);
     const baseId = payload.id || uuidv4();
     const bodyText = payload.payload.body_md || "";
 
-    // If scene body is oversized → split into parts
+    // Split oversized text
     if (bodyText.length > 8000) {
       const parts = splitText(bodyText);
       const savedParts = [];

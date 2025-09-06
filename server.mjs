@@ -15,7 +15,7 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "5mb" })); // ✅ raise JSON body size limit
 
 // --- Helper: split oversized text ---
 function splitText(text, maxLen = 8000) {
@@ -28,12 +28,31 @@ function splitText(text, maxLen = 8000) {
   return parts;
 }
 
+// --- Validate request structure ---
+function validateRequest(reqBody) {
+  if (!reqBody || typeof reqBody !== "object") {
+    return "Missing request body";
+  }
+  if (!reqBody.payload || typeof reqBody.payload !== "object") {
+    return "Missing payload object";
+  }
+  if (!reqBody.payload.doc_type) {
+    return "Missing payload.doc_type";
+  }
+  if (!reqBody.payload.title) {
+    return "Missing payload.title";
+  }
+  return null; // valid
+}
+
+// --- Routes ---
+
 // Health check
 app.get("/health", (req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
 });
 
-// Read documents (preferred route)
+// Read documents
 app.get("/lyra/read", async (req, res) => {
   try {
     const docs = await lyraRead(req.query);
@@ -44,7 +63,7 @@ app.get("/lyra/read", async (req, res) => {
   }
 });
 
-// Alias: GET /doc → same as /lyra/read
+// Alias: GET /doc
 app.get("/doc", async (req, res) => {
   try {
     const docs = await lyraRead(req.query);
@@ -66,18 +85,19 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// Paste-save (create or update, with auto-split for big scenes)
-app.post("/lyra/paste-save", async (req, res) => {
+// Core save handler (shared by /lyra/paste-save and /doc POST)
+async function handleSave(req, res) {
   try {
-    const payload = req.body;
-    if (!payload || !payload.payload) {
-      return res.status(400).json({ error: "Invalid request: missing payload" });
+    const validationError = validateRequest(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: `Invalid request: ${validationError}` });
     }
 
+    const payload = req.body;
     const baseId = payload.id || uuidv4();
     const bodyText = payload.payload.body_md || "";
 
-    // If scene is too large, split into multiple docs
+    // If scene body is oversized → split into parts
     if (bodyText.length > 8000) {
       const parts = splitText(bodyText);
       const savedParts = [];
@@ -96,59 +116,26 @@ app.post("/lyra/paste-save", async (req, res) => {
         savedParts.push(result);
       }
 
-      return res.json({ id: baseId, parts: savedParts.length, results: savedParts });
+      return res.json({
+        id: baseId,
+        parts: savedParts.length,
+        results: savedParts,
+      });
     }
 
-    // Normal save (no split)
+    // Normal save
     const id = baseId;
     const result = await createOrUpdateDoc(id, payload);
     res.json({ id, result });
   } catch (err) {
-    console.error("❌ /lyra/paste-save error", err);
+    console.error("❌ Save error", err);
     res.status(500).json({ error: err.message });
   }
-});
+}
 
-// Alias: POST /doc → same as /lyra/paste-save
-app.post("/doc", async (req, res) => {
-  try {
-    const payload = req.body;
-    if (!payload || !payload.payload) {
-      return res.status(400).json({ error: "Invalid request: missing payload" });
-    }
-
-    const baseId = payload.id || uuidv4();
-    const bodyText = payload.payload.body_md || "";
-
-    if (bodyText.length > 8000) {
-      const parts = splitText(bodyText);
-      const savedParts = [];
-
-      for (let idx = 0; idx < parts.length; idx++) {
-        const partPayload = {
-          ...payload,
-          id: `${baseId}-p${idx + 1}`,
-          payload: {
-            ...payload.payload,
-            title: `${payload.payload.title} (Part ${idx + 1})`,
-            body_md: parts[idx],
-          },
-        };
-        const result = await createOrUpdateDoc(partPayload.id, partPayload);
-        savedParts.push(result);
-      }
-
-      return res.json({ id: baseId, parts: savedParts.length, results: savedParts });
-    }
-
-    const id = baseId;
-    const result = await createOrUpdateDoc(id, payload);
-    res.json({ id, result });
-  } catch (err) {
-    console.error("❌ /doc POST error", err);
-    res.status(500).json({ error: err.message });
-  }
-});
+// Paste-save routes
+app.post("/lyra/paste-save", handleSave);
+app.post("/doc", handleSave);
 
 // Export all docs
 app.get("/export", async (req, res) => {

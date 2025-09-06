@@ -20,13 +20,77 @@ async function query(text, params) {
   }
 }
 
+// --- Helper: split oversized text ---
+function splitText(text, maxLen = 8000) {
+  const parts = [];
+  let i = 0;
+  while (i < text.length) {
+    parts.push(text.slice(i, i + maxLen));
+    i += maxLen;
+  }
+  return parts;
+}
+
+// --- Helper: merge split docs ---
+function mergeParts(rows) {
+  const grouped = {};
+
+  for (const row of rows) {
+    const baseId = row.id.includes("-p") ? row.id.split("-p")[0] : row.id;
+
+    if (!grouped[baseId]) {
+      grouped[baseId] = { ...row, id: baseId, body: "" };
+    }
+
+    grouped[baseId].body += row.body || "";
+  }
+
+  return Object.values(grouped);
+}
+
 // --- Create Doc ---
 export async function createDoc(project_name, payload, topLevel = {}) {
   const id = payload.id || uuidv4();
 
   const tags = payload.tags || topLevel.tags || [];
   const meta = payload.meta || topLevel.meta || {};
+  const body = payload.body_md || "";
 
+  // ✅ Oversized: split into parts
+  if (body.length > 8000) {
+    const parts = splitText(body);
+    const savedParts = [];
+
+    for (let idx = 0; idx < parts.length; idx++) {
+      const partId = `${id}-p${idx + 1}`;
+      const partResult = await query(
+        `
+        INSERT INTO writing.misc (id, book_id, doc_type, title, body, tags, meta)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (id) DO UPDATE
+        SET title = EXCLUDED.title,
+            body = EXCLUDED.body,
+            tags = EXCLUDED.tags,
+            meta = EXCLUDED.meta
+        RETURNING *;
+        `,
+        [
+          partId,
+          "00000000-0000-0000-0000-000000000001",
+          payload.doc_type,
+          `${payload.title} (Part ${idx + 1})`,
+          parts[idx],
+          JSON.stringify(tags),
+          JSON.stringify(meta),
+        ]
+      );
+      savedParts.push(partResult.rows[0]);
+    }
+
+    return { id, parts: savedParts.length, results: savedParts };
+  }
+
+  // ✅ Normal insert
   const result = await query(
     `
     INSERT INTO writing.misc (id, book_id, doc_type, title, body, tags, meta)
@@ -40,10 +104,10 @@ export async function createDoc(project_name, payload, topLevel = {}) {
     `,
     [
       id,
-      "00000000-0000-0000-0000-000000000001", // default book_id
+      "00000000-0000-0000-0000-000000000001",
       payload.doc_type,
       payload.title,
-      payload.body_md || "",
+      body,
       JSON.stringify(tags),
       JSON.stringify(meta),
     ]
@@ -97,7 +161,7 @@ export async function createOrUpdateDoc(id, request) {
   return createDoc(project_name, payload, topLevel);
 }
 
-// --- Read Docs (with merge of parts) ---
+// --- Read Docs ---
 export async function readDocs(filters = {}) {
   let sql = `SELECT * FROM writing.misc WHERE 1=1`;
   const values = [];
@@ -112,29 +176,13 @@ export async function readDocs(filters = {}) {
     values.push(filters.title);
   }
 
-  sql += ` ORDER BY updated_at ASC`;
-
   const result = await query(sql, values);
-  const rows = result.rows;
 
-  // --- Merge "(Part N)" docs ---
-  const merged = {};
-  for (const row of rows) {
-    const baseTitle = row.title.replace(/\(Part \d+\)$/, "").trim();
-
-    if (!merged[baseTitle]) {
-      merged[baseTitle] = { ...row, body: row.body || "" };
-    } else {
-      merged[baseTitle].body += "\n\n" + (row.body || "");
-      merged[baseTitle].updated_at =
-        row.updated_at > merged[baseTitle].updated_at ? row.updated_at : merged[baseTitle].updated_at;
-    }
-  }
-
-  return Object.values(merged);
+  // ✅ Merge split docs into full scenes
+  return mergeParts(result.rows);
 }
 
-// --- Search Docs (with merge) ---
+// --- Search Docs ---
 export async function searchDocs(filters = {}) {
   const q = filters.q || "";
   const result = await query(
@@ -146,36 +194,17 @@ export async function searchDocs(filters = {}) {
     [`%${q}%`]
   );
 
-  const rows = result.rows;
-  const merged = {};
-  for (const row of rows) {
-    const baseTitle = row.title.replace(/\(Part \d+\)$/, "").trim();
-
-    if (!merged[baseTitle]) {
-      merged[baseTitle] = { ...row, body: row.body || "" };
-    } else {
-      merged[baseTitle].body += "\n\n" + (row.body || "");
-    }
-  }
-
-  return Object.values(merged);
+  // ✅ Merge split docs so search results show full scenes
+  return mergeParts(result.rows);
 }
 
-// --- Export Project (with merge) ---
+// --- Export Project ---
 export async function exportProject(project_name) {
-  const result = await query(`SELECT * FROM writing.misc ORDER BY updated_at DESC`, []);
-  const rows = result.rows;
+  const result = await query(
+    `SELECT * FROM writing.misc ORDER BY updated_at DESC`,
+    []
+  );
 
-  const merged = {};
-  for (const row of rows) {
-    const baseTitle = row.title.replace(/\(Part \d+\)$/, "").trim();
-
-    if (!merged[baseTitle]) {
-      merged[baseTitle] = { ...row, body: row.body || "" };
-    } else {
-      merged[baseTitle].body += "\n\n" + (row.body || "");
-    }
-  }
-
-  return { docs: Object.values(merged) };
+  // ✅ Merge split docs so export has whole docs
+  return { docs: mergeParts(result.rows) };
 }

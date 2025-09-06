@@ -22,13 +22,24 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
 });
 
-// Read documents
+// Read documents (preferred route)
 app.get("/lyra/read", async (req, res) => {
   try {
     const docs = await lyraRead(req.query);
     res.json(docs);
   } catch (err) {
     console.error("❌ /lyra/read error", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Alias: /doc → same as /lyra/read
+app.get("/doc", async (req, res) => {
+  try {
+    const docs = await lyraRead(req.query);
+    res.json(docs);
+  } catch (err) {
+    console.error("❌ /doc error", err);
     res.status(500).json({ error: err.message });
   }
 });

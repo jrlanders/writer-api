@@ -1,137 +1,124 @@
 // db.pg.mjs
-import pg from "pg";
+import pkg from "pg";
 import { v4 as uuidv4 } from "uuid";
 
-const { Pool } = pg;
+const { Pool } = pkg;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-// --- Low-level helper ---
-export async function query(sql, params = []) {
+// --- Helper: query wrapper ---
+async function query(text, params) {
   const client = await pool.connect();
   try {
-    const result = await client.query(sql, params);
-    return result;
+    const res = await client.query(text, params);
+    return res;
   } finally {
     client.release();
   }
 }
 
-// --- READ docs ---
-export async function readDocs({ project_name, doc_type, title, id, tags }) {
-  let where = [];
-  let params = [];
-  let idx = 1;
+// --- Create Doc ---
+export async function createDoc(project_name, payload) {
+  const id = payload.id || uuidv4();
 
-  if (doc_type) {
-    where.push(`doc_type = $${idx++}`);
-    params.push(doc_type);
-  }
-  if (title) {
-    where.push(`title ILIKE $${idx++}`);
-    params.push(`%${title}%`);
-  }
-  if (id) {
-    where.push(`id = $${idx++}`);
-    params.push(id);
-  }
-  if (tags && tags.length) {
-    where.push(`tags @> $${idx++}`);
-    params.push(JSON.stringify(tags));
-  }
+  const result = await query(
+    `
+    INSERT INTO writing.misc (id, book_id, doc_type, title, body, tags, meta)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    ON CONFLICT (id) DO UPDATE
+    SET title = EXCLUDED.title,
+        body = EXCLUDED.body,
+        tags = EXCLUDED.tags,
+        meta = EXCLUDED.meta
+    RETURNING *;
+    `,
+    [
+      id,
+      "00000000-0000-0000-0000-000000000001", // default book_id for now
+      payload.doc_type,
+      payload.title,
+      payload.body_md || "",
+      JSON.stringify(payload.tags || []),
+      JSON.stringify(payload.meta || {}),
+    ]
+  );
 
-  const sql = `
-    SELECT id, doc_type, title, body, tags, meta, created_at, updated_at
-    FROM writing.concepts
-    ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
-    ORDER BY updated_at DESC
-    LIMIT 50
-  `;
-
-  const result = await query(sql, params);
-  return result.rows;
+  return result.rows[0];
 }
 
-// --- SEARCH docs ---
-export async function searchDocs({ project_name, q }) {
-  const sql = `
-    SELECT id, doc_type, title, body, tags, meta
-    FROM writing.concepts
-    WHERE to_tsvector('english', coalesce(title,'') || ' ' || coalesce(body,'')) @@ plainto_tsquery($1)
-    ORDER BY updated_at DESC
-    LIMIT 50
-  `;
-  const result = await query(sql, [q]);
-  return result.rows;
-}
+// --- Update Doc ---
+export async function updateDoc(project_name, id, payload, sceneWriteMode) {
+  let updateSql = `UPDATE writing.misc SET `;
+  const fields = [];
+  const values = [];
+  let i = 1;
 
-// --- SAVE doc (create/update) ---
-export async function saveDoc({ project_name, docMode, sceneWriteMode, id, payload }) {
-  const {
-    doc_type,
-    title,
-    body_md,
-    tags = [],
-    meta = {},
-  } = payload;
-
-  const docId = id || uuidv4();
-
-  if (docMode === "update") {
+  if (payload.title) {
+    fields.push(`title = $${i++}`);
+    values.push(payload.title);
+  }
+  if (payload.body_md) {
     if (sceneWriteMode === "append") {
-      // Append to body
-      const sql = `
-        UPDATE writing.concepts
-        SET body = coalesce(body, '') || $1,
-            updated_at = now()
-        WHERE id = $2
-        RETURNING *
-      `;
-      const result = await query(sql, [`\n${body_md || ""}`, docId]);
-      return result.rows[0];
+      fields.push(`body = COALESCE(body, '') || $${i++}`);
     } else {
-      // Overwrite update
-      const sql = `
-        UPDATE writing.concepts
-        SET title = $1,
-            body = $2,
-            tags = $3,
-            meta = $4,
-            updated_at = now()
-        WHERE id = $5
-        RETURNING *
-      `;
-      const result = await query(sql, [title, body_md, JSON.stringify(tags), JSON.stringify(meta), docId]);
-      return result.rows[0];
+      fields.push(`body = $${i++}`);
     }
-  } else {
-    // CREATE new doc
-    const sql = `
-      INSERT INTO writing.concepts (id, book_id, doc_type, title, body, tags, meta)
-      VALUES ($1, (SELECT id FROM writing.books LIMIT 1), $2, $3, $4, $5, $6)
-      ON CONFLICT (id) DO UPDATE
-      SET title = EXCLUDED.title,
-          body = EXCLUDED.body,
-          tags = EXCLUDED.tags,
-          meta = EXCLUDED.meta,
-          updated_at = now()
-      RETURNING *
-    `;
-    const result = await query(sql, [docId, doc_type, title, body_md, JSON.stringify(tags), JSON.stringify(meta)]);
-    return result.rows[0];
+    values.push(payload.body_md);
   }
+  if (payload.tags) {
+    fields.push(`tags = $${i++}`);
+    values.push(JSON.stringify(payload.tags));
+  }
+  if (payload.meta) {
+    fields.push(`meta = $${i++}`);
+    values.push(JSON.stringify(payload.meta));
+  }
+
+  updateSql += fields.join(", ") + ` WHERE id = $${i} RETURNING *`;
+  values.push(id);
+
+  const result = await query(updateSql, values);
+  return result.rows[0];
 }
 
-// --- EXPORT all docs for a project ---
-export async function exportProject({ project_name }) {
-  const sql = `
-    SELECT id, doc_type, title, body, tags, meta, created_at, updated_at
-    FROM writing.concepts
-    ORDER BY updated_at DESC
-  `;
-  const result = await query(sql);
+// --- Read Docs ---
+export async function readDocs(filters = {}) {
+  let sql = `SELECT * FROM writing.misc WHERE 1=1`;
+  const values = [];
+  let i = 1;
+
+  if (filters.doc_type) {
+    sql += ` AND doc_type = $${i++}`;
+    values.push(filters.doc_type);
+  }
+  if (filters.title) {
+    sql += ` AND title ILIKE $${i++}`;
+    values.push(filters.title);
+  }
+
+  const result = await query(sql, values);
   return result.rows;
+}
+
+// --- Search Docs ---
+export async function searchDocs(filters = {}) {
+  const q = filters.q || "";
+  const result = await query(
+    `
+    SELECT * FROM writing.misc
+    WHERE title ILIKE $1 OR body ILIKE $1
+    ORDER BY updated_at DESC
+    `,
+    [`%${q}%`]
+  );
+  return result.rows;
+}
+
+// --- Export Project ---
+export async function exportProject(project_name) {
+  const result = await query(`SELECT * FROM writing.misc`, []);
+  return { docs: result.rows };
 }

@@ -1,120 +1,99 @@
-// server.mjs
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-
 import {
-  createDoc,
-  updateDoc,
+  createOrUpdateDoc,
   readDocs,
   searchDocs,
   exportProject,
+  ingestDocs
 } from "./db.pg.mjs";
 
 dotenv.config();
 const app = express();
-const PORT = process.env.PORT || 3000;
-
 app.use(cors());
 app.use(express.json());
 
-// --- Health Check ---
+const PORT = process.env.PORT || 3000;
+
+// Health check
 app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
+  res.json({ status: "ok", service: "Lyra Writer API" });
 });
 
-// --- Read ---
+// Read docs
 app.get("/lyra/read", async (req, res) => {
   try {
-    const docs = await readDocs(req.query);
-    res.json(docs);
+    const { project_name, id, title, doc_type, tags, ci } = req.query;
+    const result = await readDocs({
+      project_name,
+      id,
+      title,
+      doc_type,
+      tags,
+      ci
+    });
+    res.json(result);
   } catch (err) {
-    console.error("❌ Read error:", err);
-    res.status(500).json({ error: "Failed to read docs" });
+    console.error("❌ /lyra/read error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// --- Search ---
-app.get("/search", async (req, res) => {
-  try {
-    const results = await searchDocs(req.query);
-    res.json(results);
-  } catch (err) {
-    console.error("❌ Search error:", err);
-    res.status(500).json({ error: "Failed to search docs" });
-  }
-});
-
-// --- Paste-Save (create/update single doc) ---
+// Create or update docs (formerly paste-save)
 app.post("/lyra/paste-save", async (req, res) => {
   try {
     const { project_name, docMode, sceneWriteMode, id, payload } = req.body;
-
-    if (docMode === "update" && id) {
-      const updated = await updateDoc(project_name, id, payload, sceneWriteMode);
-      res.json({ status: "updated", doc: updated });
-    } else {
-      const created = await createDoc(project_name, payload);
-      res.json({ status: "created", doc: created });
-    }
+    const result = await createOrUpdateDoc(
+      project_name,
+      payload,
+      docMode,
+      sceneWriteMode,
+      id
+    );
+    res.json({ success: true, result });
   } catch (err) {
-    console.error("❌ Paste-Save error:", err);
-    res.status(500).json({ error: "Failed to save doc" });
+    console.error("❌ /lyra/paste-save error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// --- Ingest (batch create/update multiple docs) ---
+// Batch ingest
 app.post("/lyra/ingest", async (req, res) => {
   try {
     const { project_name, docs } = req.body;
-    if (!Array.isArray(docs)) {
-      return res.status(400).json({ error: "docs must be an array" });
-    }
-
-    const results = [];
-    for (const doc of docs) {
-      try {
-        if (doc.docMode === "update" && doc.id) {
-          const updated = await updateDoc(
-            project_name,
-            doc.id,
-            doc.payload,
-            doc.sceneWriteMode
-          );
-          results.push({ id: doc.id, status: "updated" });
-        } else {
-          const created = await createDoc(project_name, doc.payload);
-          results.push({ id: created.id, status: "created" });
-        }
-      } catch (innerErr) {
-        console.error(`❌ Ingest error for doc ${doc.id || "new"}:`, innerErr);
-        results.push({
-          id: doc.id || null,
-          status: "error",
-          message: innerErr.message,
-        });
-      }
-    }
-
-    res.json({ status: "ok", results });
+    const result = await ingestDocs(project_name, docs);
+    res.json({ success: true, result });
   } catch (err) {
-    console.error("❌ Ingest error:", err);
-    res.status(500).json({ error: "Failed to ingest docs" });
+    console.error("❌ /lyra/ingest error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// --- Export ---
+// Search
+app.get("/search", async (req, res) => {
+  try {
+    const { project_name, q, limit } = req.query;
+    const result = await searchDocs(project_name, q, limit);
+    res.json(result);
+  } catch (err) {
+    console.error("❌ /search error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Export
 app.get("/export", async (req, res) => {
   try {
-    const data = await exportProject(req.query.project_name);
-    res.json(data);
+    const { project_name } = req.query;
+    const result = await exportProject(project_name);
+    res.json(result);
   } catch (err) {
-    console.error("❌ Export error:", err);
-    res.status(500).json({ error: "Failed to export project" });
+    console.error("❌ /export error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// --- Start Server ---
 app.listen(PORT, () => {
-  console.log(`🚀 Lyra API running on port ${PORT}`);
+  console.log(`🚀 Lyra Writer API running on http://localhost:${PORT}`);
 });

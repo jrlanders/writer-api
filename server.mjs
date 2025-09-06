@@ -5,7 +5,7 @@ import dotenv from "dotenv";
 import { v4 as uuidv4 } from "uuid";
 
 import {
-  lyraRead,
+  readDocs as lyraRead,
   searchDocs,
   createOrUpdateDoc,
   exportProject,

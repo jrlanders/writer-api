@@ -24,7 +24,7 @@ async function query(text, params) {
 export async function createDoc(project_name, payload, topLevel = {}) {
   const id = payload.id || uuidv4();
 
-  // ✅ Normalize tags and meta
+  // ✅ Normalize tags and meta from payload or top-level
   const tags = payload.tags || topLevel.tags || [];
   const meta = payload.meta || topLevel.meta || {};
 
@@ -43,10 +43,10 @@ export async function createDoc(project_name, payload, topLevel = {}) {
       id,
       "00000000-0000-0000-0000-000000000001", // default book_id
       payload.doc_type,
-      payload.title || "Untitled",
+      payload.title,
       payload.body_md || "",
-      JSON.stringify(tags || []),
-      JSON.stringify(meta || {}),
+      JSON.stringify(tags),
+      JSON.stringify(meta),
     ]
   );
 
@@ -64,25 +64,29 @@ export async function updateDoc(project_name, id, payload, sceneWriteMode) {
     fields.push(`title = $${i++}`);
     values.push(payload.title);
   }
+
   if (payload.body_md) {
     if (sceneWriteMode === "append") {
-      fields.push(`body = COALESCE(body, '') || '\n' || $${i++}`);
+      // ✅ Append safely with newline
+      fields.push(`body = COALESCE(body, '') || E'\\n' || $${i++}`);
     } else {
       fields.push(`body = $${i++}`);
     }
     values.push(payload.body_md);
   }
+
   if (payload.tags) {
-    fields.push(`tags = COALESCE($${i++}::jsonb, tags)`);
+    fields.push(`tags = $${i++}`);
     values.push(JSON.stringify(payload.tags));
   }
+
   if (payload.meta) {
-    fields.push(`meta = COALESCE($${i++}::jsonb, meta)`);
+    fields.push(`meta = $${i++}`);
     values.push(JSON.stringify(payload.meta));
   }
 
   if (fields.length === 0) {
-    throw new Error("No fields to update");
+    throw new Error("No fields provided for update");
   }
 
   updateSql += fields.join(", ") + ` WHERE id = $${i} RETURNING *`;
@@ -114,10 +118,8 @@ export async function readDocs(filters = {}) {
   }
   if (filters.title) {
     sql += ` AND title ILIKE $${i++}`;
-    values.push(`%${filters.title}%`);
+    values.push(filters.title);
   }
-
-  sql += ` ORDER BY updated_at DESC`;
 
   const result = await query(sql, values);
   return result.rows;
@@ -129,10 +131,7 @@ export async function searchDocs(filters = {}) {
   const result = await query(
     `
     SELECT * FROM writing.misc
-    WHERE title ILIKE $1
-       OR body ILIKE $1
-       OR tags::text ILIKE $1
-       OR meta::text ILIKE $1
+    WHERE title ILIKE $1 OR body ILIKE $1
     ORDER BY updated_at DESC
     `,
     [`%${q}%`]
@@ -140,7 +139,7 @@ export async function searchDocs(filters = {}) {
   return result.rows;
 }
 
-// --- Export Project (misc only for now) ---
+// --- Export Project ---
 export async function exportProject(project_name) {
   const result = await query(
     `SELECT * FROM writing.misc ORDER BY updated_at DESC`,

@@ -31,34 +31,18 @@ function splitText(text, maxLen = 8000) {
 // --- Normalize incoming request ---
 function normalizeRequest(body) {
   if (!body) return null;
-
-  // If request already has a `payload` field → fine
-  if (body.payload) {
-    return body;
-  }
-
-  // Otherwise, wrap everything inside payload
-  return {
-    ...body,
-    payload: { ...body },
-  };
+  if (body.payload) return body; // already wrapped
+  return { ...body, payload: { ...body } }; // wrap inside payload
 }
 
 // --- Validate request structure ---
 function validateRequest(reqBody) {
-  if (!reqBody || typeof reqBody !== "object") {
-    return "Missing request body";
-  }
-  if (!reqBody.payload || typeof reqBody.payload !== "object") {
+  if (!reqBody || typeof reqBody !== "object") return "Missing request body";
+  if (!reqBody.payload || typeof reqBody.payload !== "object")
     return "Missing payload object";
-  }
-  if (!reqBody.payload.doc_type) {
-    return "Missing payload.doc_type";
-  }
-  if (!reqBody.payload.title) {
-    return "Missing payload.title";
-  }
-  return null; // valid
+  if (!reqBody.payload.doc_type) return "Missing payload.doc_type";
+  if (!reqBody.payload.title) return "Missing payload.title";
+  return null;
 }
 
 // --- Routes ---
@@ -101,36 +85,50 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// --- Core save handler (shared by /lyra/paste-save and /doc POST) ---
+// --- Core save handler ---
 async function handleSave(req, res) {
   try {
     const normalized = normalizeRequest(req.body);
     const validationError = validateRequest(normalized);
-
     if (validationError) {
-      return res.status(400).json({ error: `Invalid request: ${validationError}` });
+      return res
+        .status(400)
+        .json({ error: `Invalid request: ${validationError}` });
     }
 
     const payload = normalized;
     const baseId = payload.id || uuidv4();
     const bodyText = payload.payload.body_md || "";
 
-    // If scene body is oversized → split into parts
+    // Oversized → split into chunks
     if (bodyText.length > 8000) {
       const parts = splitText(bodyText);
+      let result;
       const savedParts = [];
 
-      for (let idx = 0; idx < parts.length; idx++) {
-        const partPayload = {
+      // First chunk = create
+      const firstPayload = {
+        ...payload,
+        id: baseId,
+        docMode: "create",
+        payload: { ...payload.payload, body_md: parts[0] },
+      };
+      result = await createOrUpdateDoc(baseId, firstPayload);
+      savedParts.push(result);
+
+      // Remaining chunks = append
+      for (let idx = 1; idx < parts.length; idx++) {
+        const appendPayload = {
           ...payload,
-          id: `${baseId}-p${idx + 1}`,
+          id: baseId,
+          docMode: "update",
+          sceneWriteMode: "append",
           payload: {
             ...payload.payload,
-            title: `${payload.payload.title} (Part ${idx + 1})`,
             body_md: parts[idx],
           },
         };
-        const result = await createOrUpdateDoc(partPayload.id, partPayload);
+        result = await createOrUpdateDoc(baseId, appendPayload);
         savedParts.push(result);
       }
 

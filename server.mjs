@@ -32,22 +32,30 @@ function splitText(text, maxLen = 8000) {
 function normalizeRequest(body) {
   if (!body) return null;
   if (body.payload) return body; // already wrapped
-  return { ...body, payload: { ...body } }; // wrap inside payload
+  return { ...body, payload: { ...body } };
 }
 
 // --- Validate request structure ---
 function validateRequest(reqBody) {
   if (!reqBody || typeof reqBody !== "object") return "Missing request body";
-  if (!reqBody.payload || typeof reqBody.payload !== "object")
-    return "Missing payload object";
+  if (!reqBody.payload || typeof reqBody.payload !== "object") return "Missing payload object";
   if (!reqBody.payload.doc_type) return "Missing payload.doc_type";
   if (!reqBody.payload.title) return "Missing payload.title";
   return null;
 }
 
+// --- Word count helper ---
+function countWords(text) {
+  if (!text) return 0;
+  return text
+    .replace(/\s+/g, " ") // collapse whitespace
+    .trim()
+    .split(" ")
+    .filter(Boolean).length;
+}
+
 // --- Routes ---
 
-// Health check
 app.get("/health", (req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
 });
@@ -74,7 +82,7 @@ app.get("/doc", async (req, res) => {
   }
 });
 
-// Search documents
+// Search
 app.get("/search", async (req, res) => {
   try {
     const results = await searchDocs(req.query);
@@ -91,55 +99,32 @@ async function handleSave(req, res) {
     const normalized = normalizeRequest(req.body);
     const validationError = validateRequest(normalized);
     if (validationError) {
-      return res
-        .status(400)
-        .json({ error: `Invalid request: ${validationError}` });
+      return res.status(400).json({ error: `Invalid request: ${validationError}` });
     }
 
     const payload = normalized;
     const baseId = payload.id || uuidv4();
     const bodyText = payload.payload.body_md || "";
 
-    // Oversized → split into chunks
     if (bodyText.length > 8000) {
       const parts = splitText(bodyText);
-      let result;
       const savedParts = [];
-
-      // First chunk = create
-      const firstPayload = {
-        ...payload,
-        id: baseId,
-        docMode: "create",
-        payload: { ...payload.payload, body_md: parts[0] },
-      };
-      result = await createOrUpdateDoc(baseId, firstPayload);
-      savedParts.push(result);
-
-      // Remaining chunks = append
-      for (let idx = 1; idx < parts.length; idx++) {
-        const appendPayload = {
+      for (let idx = 0; idx < parts.length; idx++) {
+        const partPayload = {
           ...payload,
-          id: baseId,
-          docMode: "update",
-          sceneWriteMode: "append",
+          id: `${baseId}-p${idx + 1}`,
           payload: {
             ...payload.payload,
+            title: `${payload.payload.title} (Part ${idx + 1})`,
             body_md: parts[idx],
           },
         };
-        result = await createOrUpdateDoc(baseId, appendPayload);
+        const result = await createOrUpdateDoc(partPayload.id, partPayload);
         savedParts.push(result);
       }
-
-      return res.json({
-        id: baseId,
-        parts: savedParts.length,
-        results: savedParts,
-      });
+      return res.json({ id: baseId, parts: savedParts.length, results: savedParts });
     }
 
-    // Normal save
     const id = baseId;
     const result = await createOrUpdateDoc(id, payload);
     res.json({ id, result });
@@ -149,17 +134,43 @@ async function handleSave(req, res) {
   }
 }
 
-// Paste-save routes
+// Save routes
 app.post("/lyra/paste-save", handleSave);
 app.post("/doc", handleSave);
 
-// Export all docs
+// Export
 app.get("/export", async (req, res) => {
   try {
     const data = await exportProject(req.query.project_name);
     res.json(data);
   } catch (err) {
     console.error("❌ /export error", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- New Stats Endpoint ---
+app.get("/stats", async (req, res) => {
+  try {
+    const allDocs = await lyraRead({});
+    const scenes = allDocs.filter(d => d.doc_type === "scene");
+
+    const perScene = scenes.map(s => ({
+      id: s.id,
+      title: s.title,
+      word_count: countWords(s.body),
+    }));
+
+    const totalWordCount = perScene.reduce((sum, s) => sum + s.word_count, 0);
+
+    res.json({
+      total_docs: allDocs.length,
+      total_scenes: scenes.length,
+      total_word_count: totalWordCount,
+      per_scene: perScene,
+    });
+  } catch (err) {
+    console.error("❌ /stats error", err);
     res.status(500).json({ error: err.message });
   }
 });

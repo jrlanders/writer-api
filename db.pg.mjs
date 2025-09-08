@@ -20,13 +20,27 @@ async function query(text, params) {
   }
 }
 
+// --- Helper: word count (clean + accurate) ---
+function wordCount(text = "") {
+  return text
+    .replace(/[^\S\r\n]+/g, " ") // collapse multiple spaces/tabs
+    .replace(/\r?\n+/g, " ")     // collapse newlines
+    .trim()
+    .split(/\s+/)                // split on spaces
+    .filter(Boolean)             // remove empty entries
+    .length;
+}
+
 // --- Create Doc ---
 export async function createDoc(project_name, payload, topLevel = {}) {
   const id = payload.id || uuidv4();
 
   // ✅ Normalize tags and meta from payload or top-level
   const tags = payload.tags || topLevel.tags || [];
-  const meta = payload.meta || topLevel.meta || {};
+  const meta = { ...(payload.meta || topLevel.meta || {}) };
+
+  // ✅ Compute word count and store in meta
+  meta.word_count = wordCount(payload.body_md || "");
 
   const result = await query(
     `
@@ -60,6 +74,9 @@ export async function updateDoc(project_name, id, payload, sceneWriteMode) {
   const values = [];
   let i = 1;
 
+  // Always update meta so word_count stays correct
+  const newMeta = { ...(payload.meta || {}) };
+
   if (payload.title) {
     fields.push(`title = $${i++}`);
     values.push(payload.title);
@@ -67,12 +84,15 @@ export async function updateDoc(project_name, id, payload, sceneWriteMode) {
 
   if (payload.body_md) {
     if (sceneWriteMode === "append") {
-      // ✅ Append safely with newline
+      // Append safely with newline
       fields.push(`body = COALESCE(body, '') || E'\\n' || $${i++}`);
     } else {
       fields.push(`body = $${i++}`);
     }
     values.push(payload.body_md);
+
+    // Add word_count update
+    newMeta.word_count = wordCount(payload.body_md);
   }
 
   if (payload.tags) {
@@ -80,9 +100,9 @@ export async function updateDoc(project_name, id, payload, sceneWriteMode) {
     values.push(JSON.stringify(payload.tags));
   }
 
-  if (payload.meta) {
+  if (Object.keys(newMeta).length > 0) {
     fields.push(`meta = $${i++}`);
-    values.push(JSON.stringify(payload.meta));
+    values.push(JSON.stringify(newMeta));
   }
 
   if (fields.length === 0) {

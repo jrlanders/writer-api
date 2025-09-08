@@ -31,31 +31,39 @@ function splitText(text, maxLen = 8000) {
 // --- Normalize incoming request ---
 function normalizeRequest(body) {
   if (!body) return null;
-  if (body.payload) return body; // already wrapped
-  return { ...body, payload: { ...body } };
+
+  // If request already has a `payload` field → fine
+  if (body.payload) {
+    return body;
+  }
+
+  // Otherwise, wrap everything inside payload
+  return {
+    ...body,
+    payload: { ...body },
+  };
 }
 
 // --- Validate request structure ---
 function validateRequest(reqBody) {
-  if (!reqBody || typeof reqBody !== "object") return "Missing request body";
-  if (!reqBody.payload || typeof reqBody.payload !== "object") return "Missing payload object";
-  if (!reqBody.payload.doc_type) return "Missing payload.doc_type";
-  if (!reqBody.payload.title) return "Missing payload.title";
-  return null;
-}
-
-// --- Word count helper ---
-function countWords(text) {
-  if (!text) return 0;
-  return text
-    .replace(/\s+/g, " ") // collapse whitespace
-    .trim()
-    .split(" ")
-    .filter(Boolean).length;
+  if (!reqBody || typeof reqBody !== "object") {
+    return "Missing request body";
+  }
+  if (!reqBody.payload || typeof reqBody.payload !== "object") {
+    return "Missing payload object";
+  }
+  if (!reqBody.payload.doc_type) {
+    return "Missing payload.doc_type";
+  }
+  if (!reqBody.payload.title) {
+    return "Missing payload.title";
+  }
+  return null; // valid
 }
 
 // --- Routes ---
 
+// Health check
 app.get("/health", (req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
 });
@@ -82,7 +90,7 @@ app.get("/doc", async (req, res) => {
   }
 });
 
-// Search
+// Search documents
 app.get("/search", async (req, res) => {
   try {
     const results = await searchDocs(req.query);
@@ -93,11 +101,12 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// --- Core save handler ---
+// --- Core save handler (shared by /lyra/paste-save and /doc POST) ---
 async function handleSave(req, res) {
   try {
     const normalized = normalizeRequest(req.body);
     const validationError = validateRequest(normalized);
+
     if (validationError) {
       return res.status(400).json({ error: `Invalid request: ${validationError}` });
     }
@@ -106,9 +115,11 @@ async function handleSave(req, res) {
     const baseId = payload.id || uuidv4();
     const bodyText = payload.payload.body_md || "";
 
+    // If scene body is oversized → split into parts
     if (bodyText.length > 8000) {
       const parts = splitText(bodyText);
       const savedParts = [];
+
       for (let idx = 0; idx < parts.length; idx++) {
         const partPayload = {
           ...payload,
@@ -122,9 +133,15 @@ async function handleSave(req, res) {
         const result = await createOrUpdateDoc(partPayload.id, partPayload);
         savedParts.push(result);
       }
-      return res.json({ id: baseId, parts: savedParts.length, results: savedParts });
+
+      return res.json({
+        id: baseId,
+        parts: savedParts.length,
+        results: savedParts,
+      });
     }
 
+    // Normal save
     const id = baseId;
     const result = await createOrUpdateDoc(id, payload);
     res.json({ id, result });
@@ -134,43 +151,76 @@ async function handleSave(req, res) {
   }
 }
 
-// Save routes
+// Paste-save routes
 app.post("/lyra/paste-save", handleSave);
 app.post("/doc", handleSave);
 
-// Export
+// --- Bulk ingest (batch of docs) ---
+app.post("/lyra/ingest-batch", async (req, res) => {
+  try {
+    if (!Array.isArray(req.body)) {
+      return res.status(400).json({ error: "Request body must be an array of docs" });
+    }
+
+    const results = [];
+    for (const doc of req.body) {
+      try {
+        const validationError = validateRequest(doc);
+        if (validationError) {
+          results.push({ title: doc?.payload?.title || "unknown", error: validationError });
+          continue;
+        }
+
+        const id = doc.id || uuidv4();
+        const bodyText = doc.payload.body_md || "";
+
+        if (bodyText.length > 8000) {
+          const parts = splitText(bodyText);
+          const savedParts = [];
+
+          for (let idx = 0; idx < parts.length; idx++) {
+            const partPayload = {
+              ...doc,
+              id: `${id}-p${idx + 1}`,
+              payload: {
+                ...doc.payload,
+                title: `${doc.payload.title} (Part ${idx + 1})`,
+                body_md: parts[idx],
+              },
+            };
+            const result = await createOrUpdateDoc(partPayload.id, partPayload);
+            savedParts.push(result);
+          }
+
+          results.push({ title: doc.payload.title, parts: savedParts.length, results: savedParts });
+        } else {
+          const result = await createOrUpdateDoc(id, doc);
+          results.push({ title: doc.payload.title, result });
+        }
+      } catch (err) {
+        console.error("❌ Ingest error for doc", doc?.payload?.title, err);
+        results.push({ title: doc?.payload?.title || "unknown", error: err.message });
+      }
+    }
+
+    res.json({
+      success: results.filter(r => !r.error).length,
+      failed: results.filter(r => r.error).length,
+      results,
+    });
+  } catch (err) {
+    console.error("❌ /lyra/ingest-batch error", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Export all docs
 app.get("/export", async (req, res) => {
   try {
     const data = await exportProject(req.query.project_name);
     res.json(data);
   } catch (err) {
     console.error("❌ /export error", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// --- New Stats Endpoint ---
-app.get("/stats", async (req, res) => {
-  try {
-    const allDocs = await lyraRead({});
-    const scenes = allDocs.filter(d => d.doc_type === "scene");
-
-    const perScene = scenes.map(s => ({
-      id: s.id,
-      title: s.title,
-      word_count: countWords(s.body),
-    }));
-
-    const totalWordCount = perScene.reduce((sum, s) => sum + s.word_count, 0);
-
-    res.json({
-      total_docs: allDocs.length,
-      total_scenes: scenes.length,
-      total_word_count: totalWordCount,
-      per_scene: perScene,
-    });
-  } catch (err) {
-    console.error("❌ /stats error", err);
     res.status(500).json({ error: err.message });
   }
 });

@@ -38,9 +38,15 @@ function normalizeRequest(body) {
 // --- Validate request structure ---
 function validateRequest(reqBody) {
   if (!reqBody || typeof reqBody !== "object") return "Missing request body";
-  if (!reqBody.payload || typeof reqBody.payload !== "object") return "Missing payload object";
+  if (!reqBody.payload || typeof reqBody.payload !== "object")
+    return "Missing payload object";
   if (!reqBody.payload.doc_type) return "Missing payload.doc_type";
-  if (!reqBody.payload.title) return "Missing payload.title";
+
+  // ✅ Allow delete mode without requiring a title
+  if (reqBody.docMode !== "delete" && !reqBody.payload.title) {
+    return "Missing payload.title";
+  }
+
   return null; // valid
 }
 

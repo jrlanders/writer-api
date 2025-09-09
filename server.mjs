@@ -18,7 +18,7 @@ app.use(cors());
 app.use(express.json({ limit: "5mb" })); // ✅ raise JSON body size limit
 
 // --- Helper: split oversized text ---
-function splitText(text, maxLen = 8000) {
+function splitText(text, maxLen = 50000) {
   const parts = [];
   let i = 0;
   while (i < text.length) {

@@ -1,4 +1,4 @@
-// server.mjs file
+// server.mjs
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -31,33 +31,16 @@ function splitText(text, maxLen = 8000) {
 // --- Normalize incoming request ---
 function normalizeRequest(body) {
   if (!body) return null;
-
-  // If request already has a `payload` field → fine
-  if (body.payload) {
-    return body;
-  }
-
-  // Otherwise, wrap everything inside payload
-  return {
-    ...body,
-    payload: { ...body },
-  };
+  if (body.payload) return body; // already wrapped
+  return { ...body, payload: { ...body } }; // auto-wrap
 }
 
 // --- Validate request structure ---
 function validateRequest(reqBody) {
-  if (!reqBody || typeof reqBody !== "object") {
-    return "Missing request body";
-  }
-  if (!reqBody.payload || typeof reqBody.payload !== "object") {
-    return "Missing payload object";
-  }
-  if (!reqBody.payload.doc_type) {
-    return "Missing payload.doc_type";
-  }
-  if (!reqBody.payload.title) {
-    return "Missing payload.title";
-  }
+  if (!reqBody || typeof reqBody !== "object") return "Missing request body";
+  if (!reqBody.payload || typeof reqBody.payload !== "object") return "Missing payload object";
+  if (!reqBody.payload.doc_type) return "Missing payload.doc_type";
+  if (!reqBody.payload.title) return "Missing payload.title";
   return null; // valid
 }
 
@@ -101,12 +84,11 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// --- Core save handler (shared by /lyra/paste-save and /doc POST) ---
+// --- Core save handler ---
 async function handleSave(req, res) {
   try {
     const normalized = normalizeRequest(req.body);
     const validationError = validateRequest(normalized);
-
     if (validationError) {
       return res.status(400).json({ error: `Invalid request: ${validationError}` });
     }
@@ -115,11 +97,10 @@ async function handleSave(req, res) {
     const baseId = payload.id || uuidv4();
     const bodyText = payload.payload.body_md || "";
 
-    // If scene body is oversized → split into parts
+    // Oversized scenes → split
     if (bodyText.length > 8000) {
       const parts = splitText(bodyText);
       const savedParts = [];
-
       for (let idx = 0; idx < parts.length; idx++) {
         const partPayload = {
           ...payload,
@@ -133,15 +114,9 @@ async function handleSave(req, res) {
         const result = await createOrUpdateDoc(partPayload.id, partPayload);
         savedParts.push(result);
       }
-
-      return res.json({
-        id: baseId,
-        parts: savedParts.length,
-        results: savedParts,
-      });
+      return res.json({ id: baseId, parts: savedParts.length, results: savedParts });
     }
 
-    // Normal save
     const id = baseId;
     const result = await createOrUpdateDoc(id, payload);
     res.json({ id, result });
@@ -163,8 +138,21 @@ app.post("/lyra/ingest-batch", async (req, res) => {
     }
 
     const results = [];
-    for (const doc of req.body) {
+    for (const rawDoc of req.body) {
       try {
+        // Auto-wrap into payload if not already wrapped
+        const doc = rawDoc.payload ? rawDoc : {
+          docMode: "create",
+          payload: {
+            doc_type: rawDoc.doc_type,
+            title: rawDoc.title,
+            body_md: rawDoc.body_md || "",
+            tags: rawDoc.tags || [],
+            meta: rawDoc.meta || {}
+          },
+          id: rawDoc.id || uuidv4()
+        };
+
         const validationError = validateRequest(doc);
         if (validationError) {
           results.push({ title: doc?.payload?.title || "unknown", error: validationError });
@@ -177,7 +165,6 @@ app.post("/lyra/ingest-batch", async (req, res) => {
         if (bodyText.length > 8000) {
           const parts = splitText(bodyText);
           const savedParts = [];
-
           for (let idx = 0; idx < parts.length; idx++) {
             const partPayload = {
               ...doc,
@@ -191,15 +178,14 @@ app.post("/lyra/ingest-batch", async (req, res) => {
             const result = await createOrUpdateDoc(partPayload.id, partPayload);
             savedParts.push(result);
           }
-
           results.push({ title: doc.payload.title, parts: savedParts.length, results: savedParts });
         } else {
           const result = await createOrUpdateDoc(id, doc);
           results.push({ title: doc.payload.title, result });
         }
       } catch (err) {
-        console.error("❌ Ingest error for doc", doc?.payload?.title, err);
-        results.push({ title: doc?.payload?.title || "unknown", error: err.message });
+        console.error("❌ Ingest error for doc", rawDoc?.title, err);
+        results.push({ title: rawDoc?.title || "unknown", error: err.message });
       }
     }
 

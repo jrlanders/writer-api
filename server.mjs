@@ -211,6 +211,19 @@ app.get("/export", async (req, res) => {
   }
 });
 
+// --- Hard Reset: Lyra Index ---
+app.post("/lyra/refresh", async (req, res) => {
+  try {
+    console.log("🧹 Clearing Lyra index...");
+    const data = await exportProject(req.query.project_name || "default");
+    console.log(`🔄 Rebuilt Lyra index with ${data.docs.length} docs`);
+    res.json({ success: true, count: data.docs.length });
+  } catch (err) {
+    console.error("❌ /lyra/refresh error", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Lyra API running on port ${PORT}`);
